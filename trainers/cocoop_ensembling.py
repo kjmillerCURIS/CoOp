@@ -24,8 +24,9 @@ import time
 import datetime
 from tqdm import tqdm
 
-_tokenizer = _Tokenizer()
+from .cocoop import PromptLearner
 
+_tokenizer = _Tokenizer()
 
 
 def load_clip_to_cpu(cfg):
@@ -69,167 +70,57 @@ class TextEncoder(nn.Module):
         return x
 
 
-class PromptLearner(nn.Module):
-    def __init__(self, cfg, classnames, clip_model):
-        super().__init__()
-        n_cls = len(classnames)
-        n_ctx = cfg.TRAINER.COOP.N_CTX
-        ctx_init = cfg.TRAINER.COOP.CTX_INIT
-        dtype = clip_model.dtype
-        ctx_dim = clip_model.ln_final.weight.shape[0]
-        clip_imsize = clip_model.visual.input_resolution
-        cfg_imsize = cfg.INPUT.SIZE[0]
-        assert cfg_imsize == clip_imsize, f"cfg_imsize ({cfg_imsize}) must equal to clip_imsize ({clip_imsize})"
-
-        if ctx_init:
-            # use given words to initialize context vectors
-            ctx_init = ctx_init.replace("_", " ")
-            n_ctx = len(ctx_init.split(" "))
-            prompt = clip.tokenize(ctx_init)
-            with torch.no_grad():
-                embedding = clip_model.token_embedding(prompt).type(dtype)
-            ctx_vectors = embedding[0, 1 : 1 + n_ctx, :]
-            prompt_prefix = ctx_init
-
-        else:
-            # random initialization
-            if cfg.TRAINER.COOP.CSC:
-                print("Initializing class-specific contexts")
-                ctx_vectors = torch.empty(n_cls, n_ctx, ctx_dim, dtype=dtype)
-            else:
-                print("Initializing a generic context")
-                ctx_vectors = torch.empty(n_ctx, ctx_dim, dtype=dtype)
-            nn.init.normal_(ctx_vectors, std=0.02)
-            prompt_prefix = " ".join(["X"] * n_ctx)
-
-        print(f'Initial context: "{prompt_prefix}"')
-        print(f"Number of context words (tokens): {n_ctx}")
-
-        self.ctx = nn.Parameter(ctx_vectors)  # to be optimized
-
-        classnames = [name.replace("_", " ") for name in classnames]
-        name_lens = [len(_tokenizer.encode(name)) for name in classnames]
-        prompts = [prompt_prefix + " " + name + "." for name in classnames]
-
-        tokenized_prompts = torch.cat([clip.tokenize(p) for p in prompts])
-        with torch.no_grad():
-            embedding = clip_model.token_embedding(tokenized_prompts).type(dtype)
-
-        # These token vectors will be saved when in save_model(),
-        # but they should be ignored in load_model() as we want to use
-        # those computed using the current class names
-        self.register_buffer("token_prefix", embedding[:, :1, :])  # SOS
-        self.register_buffer("token_suffix", embedding[:, 1 + n_ctx :, :])  # CLS, EOS
-
-        self.n_cls = n_cls
-        self.n_ctx = n_ctx
-        self.tokenized_prompts = tokenized_prompts  # torch.Tensor
-        self.name_lens = name_lens
-        self.class_token_position = cfg.TRAINER.COOP.CLASS_TOKEN_POSITION
-
-    def forward(self):
-        ctx = self.ctx
-        if ctx.dim() == 2:
-            ctx = ctx.unsqueeze(0).expand(self.n_cls, -1, -1)
-
-        prefix = self.token_prefix
-        suffix = self.token_suffix
-
-        if self.class_token_position == "end":
-            prompts = torch.cat(
-                [
-                    prefix,  # (n_cls, 1, dim)
-                    ctx,     # (n_cls, n_ctx, dim)
-                    suffix,  # (n_cls, *, dim)
-                ],
-                dim=1,
-            )
-
-        elif self.class_token_position == "middle":
-            half_n_ctx = self.n_ctx // 2
-            prompts = []
-            for i in range(self.n_cls):
-                name_len = self.name_lens[i]
-                prefix_i = prefix[i : i + 1, :, :]
-                class_i = suffix[i : i + 1, :name_len, :]
-                suffix_i = suffix[i : i + 1, name_len:, :]
-                ctx_i_half1 = ctx[i : i + 1, :half_n_ctx, :]
-                ctx_i_half2 = ctx[i : i + 1, half_n_ctx:, :]
-                prompt = torch.cat(
-                    [
-                        prefix_i,     # (1, 1, dim)
-                        ctx_i_half1,  # (1, n_ctx//2, dim)
-                        class_i,      # (1, name_len, dim)
-                        ctx_i_half2,  # (1, n_ctx//2, dim)
-                        suffix_i,     # (1, *, dim)
-                    ],
-                    dim=1,
-                )
-                prompts.append(prompt)
-            prompts = torch.cat(prompts, dim=0)
-
-        elif self.class_token_position == "front":
-            prompts = []
-            for i in range(self.n_cls):
-                name_len = self.name_lens[i]
-                prefix_i = prefix[i : i + 1, :, :]
-                class_i = suffix[i : i + 1, :name_len, :]
-                suffix_i = suffix[i : i + 1, name_len:, :]
-                ctx_i = ctx[i : i + 1, :, :]
-                prompt = torch.cat(
-                    [
-                        prefix_i,  # (1, 1, dim)
-                        class_i,   # (1, name_len, dim)
-                        ctx_i,     # (1, n_ctx, dim)
-                        suffix_i,  # (1, *, dim)
-                    ],
-                    dim=1,
-                )
-                prompts.append(prompt)
-            prompts = torch.cat(prompts, dim=0)
-
-        else:
-            raise ValueError
-
-        return prompts
-
-
-class CustomCLIP(nn.Module):
-    def __init__(self, cfg, classnames, clip_model):
+class CustomCLIPEnsembling(nn.Module):
+    def __init__(self, cfg, classnames, clip_model, return_attn_probs):
         super().__init__()
         self.prompt_learner = PromptLearner(cfg, classnames, clip_model)
         self.tokenized_prompts = self.prompt_learner.tokenized_prompts
         self.image_encoder = clip_model.visual
-        self.text_encoder = TextEncoder(clip_model)
+        self.return_attn_probs = return_attn_probs
+        if self.return_attn_probs:
+            self.text_encoder = ExposedTextEncoder(clip_model)
+        else:
+            self.text_encoder = TextEncoder(clip_model)
+
         self.logit_scale = clip_model.logit_scale
         self.dtype = clip_model.dtype
 
-    def forward(self, image):
-        image_features = self.image_encoder(image.type(self.dtype))
-
-        prompts = self.prompt_learner()
+    def forward(self, image, label=None):
         tokenized_prompts = self.tokenized_prompts
-        text_features = self.text_encoder(prompts, tokenized_prompts)
-
-        image_features = image_features / image_features.norm(dim=-1, keepdim=True)
-        text_features = text_features / text_features.norm(dim=-1, keepdim=True)
-
         logit_scale = self.logit_scale.exp()
-        logits = logit_scale * image_features @ text_features.t()
 
-        return logits
+        image_features = self.image_encoder(image.type(self.dtype))
+        image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+
+        prompts_list = [pl(image_features) for pl in self.prompt_learner_list]
+
+        assert(False) #KEVIN
+
+        logits = []
+
+
+        for pts_i, imf_i in zip(prompts, image_features): #this is a loop across the batch
+            text_features = self.text_encoder(pts_i, tokenized_prompts)
+            text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+            l_i = logit_scale * imf_i @ text_features.t()
+            logits.append(l_i)
+
+        logits = torch.stack(logits)
+        if self.prompt_learner_list[0].training:
+            return F.cross_entropy(logits, label)
+        
+        if self.return_attn_probs:
+            return logits, attn_probs
+        else:
+            return logits
 
 
 #@TRAINER_REGISTRY.register()
-class CoOp(TrainerX):
-    """Context Optimization (CoOp).
-
-    Learning to Prompt for Vision-Language Models
-    https://arxiv.org/abs/2109.01134
-    """
+class CoCoOpEnsembling(TrainerX):
     
-    def __init__(self, cfg, train_or_test, fewshot_seed, domain_split_index, class_split_type, eval_type):
+    def __init__(self, cfg, train_or_test, fewshot_seed, domain_split_index, class_split_type, eval_type, record_attentropy=False):
         assert(train_or_test in ['train', 'test'])
+        self.record_attentropy = record_attentropy
         
         #stuff from TrainerBase.__init__()
         self._models = OrderedDict()
@@ -259,7 +150,7 @@ class CoOp(TrainerX):
             self.evaluator = None
 
         self.best_result = -np.inf
-
+    
     def build_data_loader(self, fewshot_seed, domain_split_index, class_split_type, eval_type):
         """Create essential data-related attributes.
         """
@@ -276,30 +167,38 @@ class CoOp(TrainerX):
         self.lab2cname_train, self.lab2cname_test = dm.lab2cname_train, dm.lab2cname_test  # dict {label: classname}
 
         self.dm = dm
-
+    
     def check_cfg(self, cfg):
-        assert cfg.TRAINER.COOP.PREC in ["fp16", "fp32", "amp"]
+        assert cfg.TRAINER.COCOOP.PREC in ["fp16", "fp32", "amp"]
 
     def build_model(self, train_or_test):
         assert(train_or_test in ['train', 'test'])
-
         cfg = self.cfg
         classnames = {'train' : self.dm.dataset.classnames_train, 'test' : self.dm.dataset.classnames_test}[train_or_test]
 
         print(f"Loading CLIP (backbone: {cfg.MODEL.BACKBONE.NAME})")
         clip_model = load_clip_to_cpu(cfg)
         
-        if cfg.TRAINER.COOP.PREC == "fp32" or cfg.TRAINER.COOP.PREC == "amp":
+        if cfg.TRAINER.COCOOP.PREC == "fp32" or cfg.TRAINER.COCOOP.PREC == "amp":
             # CLIP's default precision is fp16
             clip_model.float()
 
         print("Building custom CLIP")
-        self.model = CustomCLIP(cfg, classnames, clip_model)
+        self.model = CustomCLIPEnsembling(cfg, classnames, clip_model, (train_or_test == 'test' and self.record_attentropy)) #training-vs-testing-classnames problem has already been taken care of
 
         print("Turning off gradients in both the image and the text encoder")
+        name_to_update = "prompt_learner"
+        
         for name, param in self.model.named_parameters():
-            if "prompt_learner" not in name:
+            if name_to_update not in name:
                 param.requires_grad_(False)
+        
+        # Double check
+        enabled = set()
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                enabled.add(name)
+        print(f"Parameters to be updated: {enabled}")
 
         if cfg.MODEL.INIT_WEIGHTS:
             load_pretrained_weights(self.model.prompt_learner, cfg.MODEL.INIT_WEIGHTS)
@@ -310,7 +209,7 @@ class CoOp(TrainerX):
         self.sched = build_lr_scheduler(self.optim, cfg.OPTIM)
         self.register_model("prompt_learner", self.model.prompt_learner, self.optim, self.sched)
 
-        self.scaler = GradScaler() if cfg.TRAINER.COOP.PREC == "amp" else None
+        self.scaler = GradScaler() if cfg.TRAINER.COCOOP.PREC == "amp" else None
 
         # Note that multi-gpu training could be slow because CLIP's size is
         # big, which slows down the copy operation in DataParallel
@@ -321,25 +220,26 @@ class CoOp(TrainerX):
 
     def forward_backward(self, batch):
         image, label = self.parse_batch_train(batch)
+
+        model = self.model
+        optim = self.optim
+        scaler = self.scaler
         
-        prec = self.cfg.TRAINER.COOP.PREC
+        prec = self.cfg.TRAINER.COCOOP.PREC
         if prec == "amp":
             with autocast():
-                output = self.model(image)
-                loss = F.cross_entropy(output, label)
-            self.optim.zero_grad()
-            self.scaler.scale(loss).backward()
-            self.scaler.step(self.optim)
-            self.scaler.update()
+                loss = model(image, label)
+            optim.zero_grad()
+            scaler.scale(loss).backward()
+            scaler.step(optim)
+            scaler.update()
         else:
-            output = self.model(image)
-            loss = F.cross_entropy(output, label)
-            self.model_backward_and_update(loss)
+            loss = model(image, label)
+            optim.zero_grad()
+            loss.backward()
+            optim.step()
 
-        loss_summary = {
-            "loss": loss.item(),
-            "acc": compute_accuracy(output, label)[0].item(),
-        }
+        loss_summary = {"loss": loss.item()}
 
         if (self.batch_idx + 1) == self.num_batches:
             self.update_lr()
@@ -390,6 +290,8 @@ class CoOp(TrainerX):
     @torch.no_grad()
     def test(self, split=None):
         """A generic testing pipeline."""
+        details = {}
+        
         self.set_model_mode("eval")
         self.evaluator.reset()
 
@@ -406,14 +308,39 @@ class CoOp(TrainerX):
 
         for batch_idx, batch in enumerate(tqdm(data_loader)):
             input, label, domain = self.parse_batch_test(batch)
-            output = self.model_inference(input)
+            if self.record_attentropy:
+                output, attn_probs = self.model(input)
+                assert(len(attn_probs.shape) == 3)
+                assert(attn_probs.shape[0] == input.shape[0])
+                assert(attn_probs.shape[1] == self.num_classes_test)
+                attn_probs = torch.clamp(attn_probs, min=1e-8)
+                attentropies = torch.sum(-attn_probs * torch.log(attn_probs), dim=2)
+                correct_attentropy = attentropies[torch.arange(attentropies.shape[0]), label].cpu().numpy()
+                pred_attentropy = attentropies[torch.arange(attentropies.shape[0]), output.argmax(dim=1)].cpu().numpy()
+                avg_attentropy = torch.mean(attentropies, dim=1).cpu().numpy()
+                attentropies = attentropies.cpu().numpy()
+            else:
+                output = self.model(input)
+
             self.evaluator.process(output, label, domain)
+            test_loss = F.cross_entropy(output, label, reduce=False, reduction='none')
+            for i, impath in enumerate(batch['impath']):
+                detail = {'test_loss': test_loss[i].item()}
+                if self.record_attentropy:
+                    detail['attentropies'] = attentropies[i,:]
+                    detail['correct_attentropy'] = correct_attentropy[i]
+                    detail['pred_attentropy'] = pred_attentropy[i]
+                    detail['avg_attentropy'] = avg_attentropy[i]
+
+                details[impath] = detail
 
         results = self.evaluator.evaluate()
 
         for k, v in results.items():
             tag = f"{split}/{k}"
             self.write_scalar(tag, v, self.epoch)
+
+        results['details'] = details
 
         return list(results.values())[0], results
     

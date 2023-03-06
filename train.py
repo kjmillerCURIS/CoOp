@@ -1,9 +1,13 @@
+import os
+import sys
+import pickle
+import touch
 import argparse
 import torch
 
 from dassl.utils import setup_logger, set_random_seed, collect_env_info
 from dassl.config import get_cfg_default
-from dassl.engine import build_trainer
+from build_trainer_custom import build_trainer_custom
 
 # custom
 import datasets.oxford_pets
@@ -55,17 +59,20 @@ def reset_cfg(cfg, args):
     if args.seed:
         cfg.SEED = args.seed
 
-    if args.source_domains:
-        cfg.DATASET.SOURCE_DOMAINS = args.source_domains
+#    if args.source_domains:
+#        assert(False) #these should come from dataset-config file
+#        cfg.DATASET.SOURCE_DOMAINS = args.source_domains
 
-    if args.target_domains:
-        cfg.DATASET.TARGET_DOMAINS = args.target_domains
+#    if args.target_domains:
+#        assert(False) #these should come from dataset-config file
+#        cfg.DATASET.TARGET_DOMAINS = args.target_domains
 
     if args.transforms:
         cfg.INPUT.TRANSFORMS = args.transforms
 
-    if args.trainer:
-        cfg.TRAINER.NAME = args.trainer
+#    if args.trainer:
+#        assert(False) #c'mon, this should be in the damn config file!
+#        cfg.TRAINER.NAME = args.trainer
 
     if args.backbone:
         cfg.MODEL.BACKBONE.NAME = args.backbone
@@ -99,7 +106,24 @@ def extend_cfg(cfg):
     cfg.TRAINER.COCOOP.CTX_INIT = ""  # initialization words
     cfg.TRAINER.COCOOP.PREC = "fp16"  # fp16, fp32, amp
 
-    cfg.DATASET.SUBSAMPLE_CLASSES = "all"  # all, base or new
+    #the CoOp and CoCoOp authors decided to use fp16, while the CLIP-Adapter authors decided to use fp32, so that's what we're doing for now
+    cfg.TRAINER.CLIPADAPTER = CN()
+    cfg.TRAINER.CLIPADAPTER.PREC = "fp32"
+
+    #default CLIP_Adapter to use 0.2 as the authors did for ImageNet
+    cfg.TRAINER.CLIPADAPTER.ALPHA = 0.2
+
+#    cfg.DATASET.SUBSAMPLE_CLASSES = "all"  # all, base or new
+
+    cfg.TRAINER.NAME = ""
+
+    #these will be parsed on-the-fly as dicts of lists
+    cfg.DATASET.SOURCE_DOMAINS_LIST = ''
+    cfg.DATASET.TARGET_DOMAINS_LIST = ''
+
+    #these will be parsed on-the-fly as dicts
+    cfg.DATASET.FEWSHOT_FILTER_PATHS = ''
+    cfg.DATASET.CLASS_SPLIT_PATHS = ''
 
 
 def setup_cfg(args):
@@ -139,21 +163,50 @@ def main(args):
     print("Collecting env info ...")
     print("** System info **\n{}\n".format(collect_env_info()))
 
-    trainer = build_trainer(cfg)
+    if args.eval_only:
+        train_or_test = 'test'
+    else:
+        assert(not args.no_train)
+        train_or_test = 'train'
+
+    trainer = build_trainer_custom(cfg, train_or_test, args.fewshot_seed, args.domain_split_index, args.class_split_type, args.eval_type, record_attentropy=args.record_attentropy)
 
     if args.eval_only:
+        results_filename = os.path.join(cfg.OUTPUT_DIR, 'results.pkl')
+        if args.skip_if_results_exists and os.path.exists(results_filename):
+            print('results.pkl file already exists at "%s", skipping'%(results_filename))
+            return
+
+        if args.model_dir:
+            done_filename = os.path.join(args.model_dir, 'done')
+            if not os.path.exists(done_filename):
+                print('Training not done yet! We were expecting a "done-file" at "%s". Please finish training.'%(done_filename))
+                return
+
         trainer.load_model(args.model_dir, epoch=args.load_epoch)
-        trainer.test()
+        _, results = trainer.test()
+
+        #seriously, why wouldn't they already do this???
+        with open(results_filename, 'wb') as f:
+            pickle.dump(results, f)
+
         return
 
     if not args.no_train:
+        done_filename = os.path.join(cfg.OUTPUT_DIR, 'done')
+        if os.path.exists(done_filename):
+            print('Already done! No need to train!')
+            return
+
         trainer.train()
 
+        print('Training done! Writing "done-file" to "%s"'%(done_filename))
+        touch.touch(done_filename)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", type=str, default="", help="path to dataset")
-    parser.add_argument("--output-dir", type=str, default="", help="output directory")
+    parser.add_argument("--output-dir", type=str, default="", help="output directory. This is where train mode saves the model, and where eval mode saves the results. So if you are training now, you would pass the same thing in as the model-dir argument when evaluating that model.")
     parser.add_argument(
         "--resume",
         type=str,
@@ -163,12 +216,12 @@ if __name__ == "__main__":
     parser.add_argument(
         "--seed", type=int, default=-1, help="only positive value enables a fixed seed"
     )
-    parser.add_argument(
-        "--source-domains", type=str, nargs="+", help="source domains for DA/DG"
-    )
-    parser.add_argument(
-        "--target-domains", type=str, nargs="+", help="target domains for DA/DG"
-    )
+#    parser.add_argument(
+#        "--source-domains", type=str, nargs="+", help="source domains for DA/DG"
+#    )
+#    parser.add_argument(
+#        "--target-domains", type=str, nargs="+", help="target domains for DA/DG"
+#    )
     parser.add_argument(
         "--transforms", type=str, nargs="+", help="data augmentation methods"
     )
@@ -181,10 +234,11 @@ if __name__ == "__main__":
         default="",
         help="path to config file for dataset setup",
     )
-    parser.add_argument("--trainer", type=str, default="", help="name of trainer")
+#    parser.add_argument("--trainer", type=str, default="", help="name of trainer")
     parser.add_argument("--backbone", type=str, default="", help="name of CNN backbone")
     parser.add_argument("--head", type=str, default="", help="name of head")
     parser.add_argument("--eval-only", action="store_true", help="evaluation only")
+    parser.add_argument("--skip-if-results-exists", action="store_true", help="skip if results.pkl already exists")
     parser.add_argument(
         "--model-dir",
         type=str,
@@ -197,11 +251,25 @@ if __name__ == "__main__":
     parser.add_argument(
         "--no-train", action="store_true", help="do not call trainer.train()"
     )
+    #trainer = build_trainer_custom(cfg, train_or_test, args.fewshot_seed, args.domain_split_index, args.class_split_type, args.eval_type)
+    parser.add_argument(
+        "--fewshot-seed", type=int, default=0, help="this maps to one of the fewshot filter files"
+    )
+    parser.add_argument(
+        "--domain-split-index", type=int, default=0, help="this maps to a domain split"
+    )
+    parser.add_argument(
+        "--class-split-type", type=str, default="random", help="this maps to one of the class split files"
+    )
+    parser.add_argument(
+        "--eval-type", type=str, default="seen_domains_seen_classes", help="which domains and classes we evaluate on (only relevant for eval mode, i.e. if you pass in eval-only flag)"
+    )
     parser.add_argument(
         "opts",
         default=None,
         nargs=argparse.REMAINDER,
         help="modify config options using the command-line",
     )
+    parser.add_argument("--record-attentropy", action="store_true", help="record text attention map entropies (only happens during test, and only for CoCoOp and ZeroshotCLIP)")
     args = parser.parse_args()
     main(args)

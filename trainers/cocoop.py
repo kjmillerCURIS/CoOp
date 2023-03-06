@@ -1,19 +1,30 @@
 import os.path as osp
 from collections import OrderedDict
 import math
+import numpy as np
 
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
 from torch.cuda.amp import GradScaler, autocast
 
-from dassl.engine import TRAINER_REGISTRY, TrainerX
+#from dassl.engine import TRAINER_REGISTRY, TrainerX
+from dassl.engine import TrainerX
 from dassl.metrics import compute_accuracy
 from dassl.utils import load_pretrained_weights, load_checkpoint
 from dassl.optim import build_optimizer, build_lr_scheduler
 
 from clip import clip
 from clip.simple_tokenizer import SimpleTokenizer as _Tokenizer
+
+from data_manager_custom import DataManagerCustom
+from custom_classification_evaluator import CustomClassificationEvaluator
+
+import time
+import datetime
+from tqdm import tqdm
+
+from .exposed_text_encoder import ExposedTextEncoder
 
 _tokenizer = _Tokenizer()
 
@@ -60,11 +71,9 @@ class TextEncoder(nn.Module):
 
 
 class PromptLearner(nn.Module):
-    def __init__(self, cfg, classnames, clip_model):
+    def __init__(self, cfg, classnames, clip_model, n_ctx, ctx_init):
         super().__init__()
         n_cls = len(classnames)
-        n_ctx = cfg.TRAINER.COCOOP.N_CTX
-        ctx_init = cfg.TRAINER.COCOOP.CTX_INIT
         dtype = clip_model.dtype
         ctx_dim = clip_model.ln_final.weight.shape[0]
         vis_dim = clip_model.visual.output_dim
@@ -162,12 +171,17 @@ class PromptLearner(nn.Module):
 
 
 class CustomCLIP(nn.Module):
-    def __init__(self, cfg, classnames, clip_model):
+    def __init__(self, cfg, classnames, clip_model, return_attn_probs):
         super().__init__()
-        self.prompt_learner = PromptLearner(cfg, classnames, clip_model)
+        self.prompt_learner = PromptLearner(cfg, classnames, clip_model, cfg.TRAINER.COCOOP.N_CTX, cfg.TRAINER.COCOOP.CTX_INIT)
         self.tokenized_prompts = self.prompt_learner.tokenized_prompts
         self.image_encoder = clip_model.visual
-        self.text_encoder = TextEncoder(clip_model)
+        self.return_attn_probs = return_attn_probs
+        if self.return_attn_probs:
+            self.text_encoder = ExposedTextEncoder(clip_model)
+        else:
+            self.text_encoder = TextEncoder(clip_model)
+
         self.logit_scale = clip_model.logit_scale
         self.dtype = clip_model.dtype
 
@@ -181,27 +195,95 @@ class CustomCLIP(nn.Module):
         prompts = self.prompt_learner(image_features)
         
         logits = []
-        for pts_i, imf_i in zip(prompts, image_features):
-            text_features = self.text_encoder(pts_i, tokenized_prompts)
+        if self.return_attn_probs:
+            attn_probs = []
+
+        for pts_i, imf_i in zip(prompts, image_features): #this is a loop across the batch
+            if self.return_attn_probs:
+                text_features, attn_probs_i = self.text_encoder(pts_i, tokenized_prompts)
+                assert(attn_probs_i.shape == tokenized_prompts.shape) #should be (num_classes, seq_len)
+            else:
+                text_features = self.text_encoder(pts_i, tokenized_prompts)
+
             text_features = text_features / text_features.norm(dim=-1, keepdim=True)
             l_i = logit_scale * imf_i @ text_features.t()
             logits.append(l_i)
+            if self.return_attn_probs:
+                attn_probs.append(attn_probs_i)
+
         logits = torch.stack(logits)
-        
+        if self.return_attn_probs:
+            attn_probs = torch.stack(attn_probs) #should be (batch_size, num_classes, seq_len)
+
         if self.prompt_learner.training:
             return F.cross_entropy(logits, label)
         
-        return logits
+        if self.return_attn_probs:
+            return logits, attn_probs
+        else:
+            return logits
 
 
-@TRAINER_REGISTRY.register()
+#@TRAINER_REGISTRY.register()
 class CoCoOp(TrainerX):
+    
+    def __init__(self, cfg, train_or_test, fewshot_seed, domain_split_index, class_split_type, eval_type, record_attentropy=False):
+        assert(train_or_test in ['train', 'test'])
+        self.record_attentropy = record_attentropy
+        
+        #stuff from TrainerBase.__init__()
+        self._models = OrderedDict()
+        self._optims = OrderedDict()
+        self._scheds = OrderedDict()
+        self._writer = None
+        
+        #stuff from SimpleTrainer.__init__(), but use train_or_test for some things
+        self.check_cfg(cfg)
+
+        if torch.cuda.is_available() and cfg.USE_CUDA:
+            self.device = torch.device("cuda")
+        else:
+            self.device = torch.device("cpu")
+
+        # Save as attributes some frequently used variables
+        self.start_epoch = self.epoch = 0
+        self.max_epoch = cfg.OPTIM.MAX_EPOCH
+        self.output_dir = cfg.OUTPUT_DIR
+
+        self.cfg = cfg
+        self.build_data_loader(fewshot_seed, domain_split_index, class_split_type, eval_type)
+        self.build_model(train_or_test)
+        if train_or_test == 'test': #no need to run evaluator if we're not testing!
+            self.evaluator = CustomClassificationEvaluator(cfg, self.lab2cname_test)
+        else:
+            self.evaluator = None
+
+        self.best_result = -np.inf
+    
+    def build_data_loader(self, fewshot_seed, domain_split_index, class_split_type, eval_type):
+        """Create essential data-related attributes.
+        """
+
+        dm = DataManagerCustom(self.cfg, fewshot_seed, domain_split_index, class_split_type, eval_type)
+
+        self.train_loader_x = dm.train_loader_x
+        self.train_loader_u = dm.train_loader_u  # optional, can be None
+        self.val_loader = dm.val_loader  # optional, can be None
+        self.test_loader = dm.test_loader
+
+        self.num_classes_train, self.num_classes_test = dm.num_classes_train, dm.num_classes_test
+        self.num_source_domains = dm.num_source_domains
+        self.lab2cname_train, self.lab2cname_test = dm.lab2cname_train, dm.lab2cname_test  # dict {label: classname}
+
+        self.dm = dm
+    
     def check_cfg(self, cfg):
         assert cfg.TRAINER.COCOOP.PREC in ["fp16", "fp32", "amp"]
 
-    def build_model(self):
+    def build_model(self, train_or_test):
+        assert(train_or_test in ['train', 'test'])
         cfg = self.cfg
-        classnames = self.dm.dataset.classnames
+        classnames = {'train' : self.dm.dataset.classnames_train, 'test' : self.dm.dataset.classnames_test}[train_or_test]
 
         print(f"Loading CLIP (backbone: {cfg.MODEL.BACKBONE.NAME})")
         clip_model = load_clip_to_cpu(cfg)
@@ -211,7 +293,7 @@ class CoCoOp(TrainerX):
             clip_model.float()
 
         print("Building custom CLIP")
-        self.model = CustomCLIP(cfg, classnames, clip_model)
+        self.model = CustomCLIP(cfg, classnames, clip_model, (train_or_test == 'test' and self.record_attentropy)) #training-vs-testing-classnames problem has already been taken care of
 
         print("Turning off gradients in both the image and the text encoder")
         name_to_update = "prompt_learner"
@@ -313,3 +395,82 @@ class CoCoOp(TrainerX):
             print("Loading weights to {} " 'from "{}" (epoch = {})'.format(name, model_path, epoch))
             # set strict=False
             self._models[name].load_state_dict(state_dict, strict=False)
+    
+    @torch.no_grad()
+    def test(self, split=None):
+        """A generic testing pipeline."""
+        details = {}
+        
+        self.set_model_mode("eval")
+        self.evaluator.reset()
+
+        if split is None:
+            split = self.cfg.TEST.SPLIT
+
+        if split == "val" and self.val_loader is not None:
+            data_loader = self.val_loader
+        else:
+            split = "test"  # in case val_loader is None
+            data_loader = self.test_loader
+
+        print(f"Evaluate on the *{split}* set")
+
+        for batch_idx, batch in enumerate(tqdm(data_loader)):
+            input, label, domain = self.parse_batch_test(batch)
+            if self.record_attentropy:
+                output, attn_probs = self.model(input)
+                assert(len(attn_probs.shape) == 3)
+                assert(attn_probs.shape[0] == input.shape[0])
+                assert(attn_probs.shape[1] == self.num_classes_test)
+                attn_probs = torch.clamp(attn_probs, min=1e-8)
+                attentropies = torch.sum(-attn_probs * torch.log(attn_probs), dim=2)
+                correct_attentropy = attentropies[torch.arange(attentropies.shape[0]), label].cpu().numpy()
+                pred_attentropy = attentropies[torch.arange(attentropies.shape[0]), output.argmax(dim=1)].cpu().numpy()
+                avg_attentropy = torch.mean(attentropies, dim=1).cpu().numpy()
+                attentropies = attentropies.cpu().numpy()
+            else:
+                output = self.model(input)
+
+            self.evaluator.process(output, label, domain)
+            test_loss = F.cross_entropy(output, label, reduce=False, reduction='none')
+            for i, impath in enumerate(batch['impath']):
+                detail = {'test_loss': test_loss[i].item()}
+                if self.record_attentropy:
+                    detail['attentropies'] = attentropies[i,:]
+                    detail['correct_attentropy'] = correct_attentropy[i]
+                    detail['pred_attentropy'] = pred_attentropy[i]
+                    detail['avg_attentropy'] = avg_attentropy[i]
+
+                details[impath] = detail
+
+        results = self.evaluator.evaluate()
+
+        for k, v in results.items():
+            tag = f"{split}/{k}"
+            self.write_scalar(tag, v, self.epoch)
+
+        results['details'] = details
+
+        return list(results.values())[0], results
+    
+    def parse_batch_test(self, batch):
+        input = batch["img"]
+        label = batch["label"]
+        domain = batch["domain"]
+
+        input = input.to(self.device)
+        label = label.to(self.device)
+        domain = domain.to(self.device)
+
+        return input, label, domain
+    
+    def after_train(self):
+        print("Finish training")
+
+        # Show elapsed time
+        elapsed = round(time.time() - self.time_start)
+        elapsed = str(datetime.timedelta(seconds=elapsed))
+        print(f"Elapsed: {elapsed}")
+
+        # Close writer
+        self.close_writer()
