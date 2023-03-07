@@ -69,10 +69,16 @@ class TextEncoder(nn.Module):
 
         return x
 
-
+#prompt will be "[SOS][LEARNABLE1][CLASS NAME][LEARNABLE2][PERIOD][EOS]"
+#LEARNABLE1 and LEARNABLE2 will be the parts that are learned/generated
+#note that "EOS" is the one that becomes the text embedding (you might've also called it the "CLS token" in your head)
 class PromptLearner(nn.Module):
+    
+    #n_ctx and ctx_init should both be pairs
     def __init__(self, cfg, classnames, clip_model, n_ctx, ctx_init):
         super().__init__()
+        n_ctx_beforename, n_ctx_aftername = n_ctx
+        ctx_init_beforename, ctx_init_aftername = ctx_init
         n_cls = len(classnames)
         dtype = clip_model.dtype
         ctx_dim = clip_model.ln_final.weight.shape[0]
@@ -81,9 +87,12 @@ class PromptLearner(nn.Module):
         cfg_imsize = cfg.INPUT.SIZE[0]
         assert cfg_imsize == clip_imsize, f"cfg_imsize ({cfg_imsize}) must equal to clip_imsize ({clip_imsize})"
 
-        if ctx_init:
+        if ctx_init_beforename or ctx_init_aftername:
             # use given words to initialize context vectors
-            ctx_init = ctx_init.replace("_", " ")
+            ctx_init_beforename = ctx_init_beforename.replace("_", " ")
+            ctx_init_aftername = ctx_init_aftername.replace("_", " ")
+            assert(len(ctx_init_beforename.split(' ')) == n_ctx_beforename)
+            assert(len(ctx_init_aftername.split(' ')) == n_ctx_aftername)
             n_ctx = len(ctx_init.split(" "))
             prompt = clip.tokenize(ctx_init)
             with torch.no_grad():
@@ -128,7 +137,31 @@ class PromptLearner(nn.Module):
         self.n_ctx = n_ctx
         self.tokenized_prompts = tokenized_prompts  # torch.Tensor
         self.name_lens = name_lens
-    
+
+    def construct_prompts(self, ctx_beforename, ctx_aftername):
+        #this assumes that we're constructing one prompt for each class
+        #ctx_beforename should have shape (n_ctx_beforename, ctx_dim)
+        #ctx_aftername should have shape (n_ctx_aftername, ctx_dim)
+        #self.start_parts, self.name_parts, self.end_parts will be lists of (*, ctx_dim) tensors
+        #self.end_parts would have the period and the EOS token, and a bunch of padding (which the transformer will ignore cuz it's causal)
+
+        prompts = []
+        for start_part, name_part, end_part in zip(self.start_parts, self.name_parts, self.end_parts):
+            items = [start_part]
+            if ctx_beforename is not None:
+                items.append(ctx_beforename)
+
+            items.append(name_part)
+            if ctx_aftername is not None:
+                items.append(ctx_aftername)
+
+            items.append(end_part)
+            prompt = torch.cat(items, dim=0)
+            prompts.append(prompt)
+
+        return torch.stack(prompts)
+
+    '''
     def construct_prompts(self, ctx, prefix, suffix, label=None):
         # dim0 is either batch_size (during training) or n_cls (during testing)
         # ctx: context tokens, with shape of (dim0, n_ctx, ctx_dim)
@@ -149,6 +182,7 @@ class PromptLearner(nn.Module):
         )
 
         return prompts
+    '''
 
     def forward(self, im_features):
         prefix = self.token_prefix

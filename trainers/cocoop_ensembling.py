@@ -25,6 +25,8 @@ import datetime
 from tqdm import tqdm
 
 from .cocoop import PromptLearner
+from .imagenet_templates import IMAGENET_TEMPLATES_SELECT
+from .zsclip import CUSTOM_TEMPLATES
 
 _tokenizer = _Tokenizer()
 
@@ -69,50 +71,90 @@ class TextEncoder(nn.Module):
 
         return x
 
+#returns a list of (n_ctx, ctx_init) pairs
+#if random prompt is to be used, then ctx_init will be None, else it will be a string (I think...)
+def get_ctx_inits(cfg):
+    templates = IMAGENET_TEMPLATES_SELECT
+    if cfg.DATASET.NAME != "ImageNet":
+        templates += [CUSTOM_TEMPLATES[cfg.DATASET.NAME]]
+
+    for template in templates
+    assert(False) #KEVIN
 
 class CustomCLIPEnsembling(nn.Module):
-    def __init__(self, cfg, classnames, clip_model, return_attn_probs):
+    def __init__(self, cfg, classnames, clip_model):
         super().__init__()
-        self.prompt_learner = PromptLearner(cfg, classnames, clip_model)
+        self.prompt_learner_list = []
+        for n_ctx, ctx_init in get_ctx_inits(cfg):
+            pl = PromptLearner(cfg, classnames, clip_model, n_ctx, ctx_init)
+            self.prompt_learner_list.append(pl)
+
+        self.prompt_learner_list = nn.ModuleList(self.prompt_learner_list)
         self.tokenized_prompts = self.prompt_learner.tokenized_prompts
         self.image_encoder = clip_model.visual
-        self.return_attn_probs = return_attn_probs
-        if self.return_attn_probs:
-            self.text_encoder = ExposedTextEncoder(clip_model)
-        else:
-            self.text_encoder = TextEncoder(clip_model)
-
-        self.logit_scale = clip_model.logit_scale
+        self.text_encoder = TextEncoder(clip_model)
+        self.logit_scale = clip_model.logit_scale #I don't think this ever gets updated, because it wouldn't have "prompt_learner" in its name
         self.dtype = clip_model.dtype
 
-    def forward(self, image, label=None):
+    #image_features should be normalized image features for whole batch
+    #it should have shape (N, D)
+    #returns normalized text features for whole batch
+    #text_features will have shape (N, C, D) where C is number of classes
+    def __compute_text_features(self, image_features, pl):
         tokenized_prompts = self.tokenized_prompts
+        (N, D) = image_features.shape
+        C = tokenized_prompts.shape[0]
+        prompts = pl(image_features)
+        all_text_features = []
+        for pts_i in prompts: #this is a loop across the batch
+            text_features = self.text_encoder(pts_i, tokenized_prompts)
+            text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+            all_text_features.append(text_features)
+
+        all_text_features = torch.stack(all_text_features)
+        assert(all_text_features.shape == (N, C, D))
+        return all_text_features
+
+    def forward(self, image, label=None, train_separately=False):
         logit_scale = self.logit_scale.exp()
 
         image_features = self.image_encoder(image.type(self.dtype))
         image_features = image_features / image_features.norm(dim=-1, keepdim=True)
 
-        prompts_list = [pl(image_features) for pl in self.prompt_learner_list]
+        text_features_list = []
+        for pl in self.prompt_learner_list:
+            text_features = self.__compute_text_features(image_features, pl)
+            text_features_list.append(text_features)
 
-        assert(False) #KEVIN
+        if self.prompt_learner_list[0].training and train_separately:
+            #compute losses separately, and average together
+            losses = []
+            for text_features in text_features_list:
+                #text_features has shape (N, C, D)
+                #image_features has shape (N, D)
+                cossims = torch.bmm(text_features, torch.unsqueeze(image_features, 2)).squeeze(dim=2)
+                logits = logit_scale * cossims
+                loss = F.cross_entropy(logits, label)
+                losses.append(loss)
 
-        logits = []
-
-
-        for pts_i, imf_i in zip(prompts, image_features): #this is a loop across the batch
-            text_features = self.text_encoder(pts_i, tokenized_prompts)
-            text_features = text_features / text_features.norm(dim=-1, keepdim=True)
-            l_i = logit_scale * imf_i @ text_features.t()
-            logits.append(l_i)
-
-        logits = torch.stack(logits)
-        if self.prompt_learner_list[0].training:
-            return F.cross_entropy(logits, label)
-        
-        if self.return_attn_probs:
-            return logits, attn_probs
+            losses = torch.stack(losses)
+            return torch.sum(losses)
         else:
-            return logits
+            #ensemble text embeddings
+            text_features = torch.mean(torch.stack(text_features_list), dim=0)
+            text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+
+            #compute logits
+            #text_features has shape (N, C, D)
+            #image_features has shape (N, D)
+            cossims = torch.bmm(text_features, torch.unsqueeze(image_features, 2)).squeeze(dim=2)
+            logits = logit_scale * cossims
+
+            #return either logits or loss
+            if self.prompt_learner_list[0].training:
+                return F.cross_entropy(logits, label)
+            else:
+                return logits
 
 
 #@TRAINER_REGISTRY.register()
