@@ -75,6 +75,7 @@ class TextEncoder(nn.Module):
 class PromptLearner(nn.Module):
     
     #n_ctx and ctx_init should both be pairs
+    #use empty strings for empty context, and None for random init (BOTH must be None)
     def __init__(self, cfg, classnames, clip_model, n_ctx, ctx_init):
         super().__init__()
         n_ctx_beforename, n_ctx_aftername = n_ctx
@@ -88,27 +89,59 @@ class PromptLearner(nn.Module):
         assert cfg_imsize == clip_imsize, f"cfg_imsize ({cfg_imsize}) must equal to clip_imsize ({clip_imsize})"
 
         if ctx_init_beforename or ctx_init_aftername:
+            assert(ctx_init_beforename is not None and ctx_init_aftername is not None)
             # use given words to initialize context vectors
-            ctx_init_beforename = ctx_init_beforename.replace("_", " ")
-            ctx_init_aftername = ctx_init_aftername.replace("_", " ")
-            assert(len(ctx_init_beforename.split(' ')) == n_ctx_beforename)
-            assert(len(ctx_init_aftername.split(' ')) == n_ctx_aftername)
-            n_ctx = len(ctx_init.split(" "))
-            prompt = clip.tokenize(ctx_init)
-            with torch.no_grad():
-                embedding = clip_model.token_embedding(prompt).type(dtype)
-            ctx_vectors = embedding[0, 1 : 1 + n_ctx, :]
-            prompt_prefix = ctx_init
+            ctx_init_beforename = ctx_init_beforename.replace('_', ' ')
+            ctx_init_aftername = ctx_init_aftername.replace('_', ' ')
+            assert(len(ctx_init_beforename.split(' ')) * int(ctx_init_beforename != '') == n_ctx_beforename)
+            assert(len(ctx_init_aftername.split(' ')) * int(ctx_init_aftername != '') == n_ctx_aftername)
+            if ctx_init_beforename != '':
+                prompt = clip.tokenize(ctx_init_beforename)
+                with torch.no_grad():
+                    embedding = clip_model.token_embedding(prompt).type(dtype)
+
+                ctx_vectors = embedding[0, 1:1+n_ctx_beforename, :]
+                self.ctx_beforename = nn.Parameter(ctx_vectors)
+                prompt_filler_beforename = ctx_init_beforename + ' '
+            else:
+                self.ctx_beforename = None
+                prompt_filler_beforename = ''
+            
+            if ctx_init_aftername != '':
+                prompt = clip.tokenize(ctx_init_aftername)
+                with torch.no_grad():
+                    embedding = clip_model.token_embedding(prompt).type(dtype)
+
+                ctx_vectors = embedding[0, 1:1+n_ctx_aftername, :]
+                self.ctx_aftername = nn.Parameter(ctx_vectors)
+                prompt_filler_aftername = ' ' + ctx_init_aftername
+            else:
+                self.ctx_aftername = None
+                prompt_filler_aftername = ''
+        
         else:
+            assert(ctx_init_beforename is None and ctx_init_aftername is None)
             # random initialization
-            ctx_vectors = torch.empty(n_ctx, ctx_dim, dtype=dtype)
-            nn.init.normal_(ctx_vectors, std=0.02)
-            prompt_prefix = " ".join(["X"] * n_ctx)
+            if n_ctx_beforename > 0:
+                ctx_vectors = torch.empty(n_ctx_beforename, ctx_dim, dtype=dtype)
+                nn.init.normal_(ctx_vectors, std=0.02)
+                self.ctx_beforename = nn.Parameter(ctx_vectors)
+                prompt_filler_beforename = ' '.join(['X'] * n_ctx_beforename) + ' '
+            else:
+                self.ctx_beforename = None
+                prompt_filler_beforename = ''
+            
+            if n_ctx_aftername > 0:
+                ctx_vectors = torch.empty(n_ctx_aftername, ctx_dim, dtype=dtype)
+                nn.init.normal_(ctx_vectors, std=0.02)
+                self.ctx_aftername = nn.Parameter(ctx_vectors)
+                prompt_filler_aftername = ' ' + ' '.join(['X'] * n_ctx_aftername)
+            else:
+                self.ctx_aftername = None
+                prompt_filler_aftername = ''
 
-        print(f'Initial context: "{prompt_prefix}"')
-        print(f"Number of context words (tokens): {n_ctx}")
-
-        self.ctx = nn.Parameter(ctx_vectors)
+        print(f'Initial contexts: "{prompt_filler_beforename}", "{prompt_filler_aftername}"')
+        print(f"Number of context words (tokens): {n_ctx_beforename}, {n_ctx_aftername}")
 
         self.meta_net = nn.Sequential(OrderedDict([
             ("linear1", nn.Linear(vis_dim, vis_dim // 16)),
@@ -121,20 +154,21 @@ class PromptLearner(nn.Module):
 
         classnames = [name.replace("_", " ") for name in classnames]
         name_lens = [len(_tokenizer.encode(name)) for name in classnames]
-        prompts = [prompt_prefix + " " + name + "." for name in classnames]
-
+        prompts = [prompt_filler_beforename + name + prompt_filler_aftername + '.' for name in classnames]
         tokenized_prompts = torch.cat([clip.tokenize(p) for p in prompts])  # (n_cls, n_tkn)
         with torch.no_grad():
             embedding = clip_model.token_embedding(tokenized_prompts).type(dtype)
 
-        # These token vectors will be saved when in save_model(),
-        # but they should be ignored in load_model() as we want to use
-        # those computed using the current class names
-        self.register_buffer("token_prefix", embedding[:, :1, :])  # SOS
-        self.register_buffer("token_suffix", embedding[:, 1 + n_ctx :, :])  # CLS, EOS
+        #have to store things as lists because some class names might have different numbers of tokens, so parts might have different lengths
+        self.start_parts, self.name_parts, self.end_parts = [], [], []
+        for i, name, name_len in enumerate(zip(classnames, name_lens)):
+            self.start_parts.append(embedding[i, :1, :]) #SOS token
+            self.name_parts.append(embedding[i, 1+n_ctx_beforename:1+n_ctx_beforename+name_len, :]) #classname tokens
+            self.end_parts.append(embedding[i, 1+n_ctx_beforename+name_len+n_ctx_aftername:, :]) #period and EOS and padding
 
         self.n_cls = n_cls
-        self.n_ctx = n_ctx
+        self.n_ctx_beforename = n_ctx_beforename
+        self.n_ctx_aftername = n_ctx_aftername
         self.tokenized_prompts = tokenized_prompts  # torch.Tensor
         self.name_lens = name_lens
 
@@ -161,44 +195,29 @@ class PromptLearner(nn.Module):
 
         return torch.stack(prompts)
 
-    '''
-    def construct_prompts(self, ctx, prefix, suffix, label=None):
-        # dim0 is either batch_size (during training) or n_cls (during testing)
-        # ctx: context tokens, with shape of (dim0, n_ctx, ctx_dim)
-        # prefix: the sos token, with shape of (n_cls, 1, ctx_dim)
-        # suffix: remaining tokens, with shape of (n_cls, *, ctx_dim)
-
-        if label is not None:
-            prefix = prefix[label]
-            suffix = suffix[label]
-
-        prompts = torch.cat(
-            [
-                prefix,  # (dim0, 1, dim)
-                ctx,     # (dim0, n_ctx, dim)
-                suffix,  # (dim0, *, dim)
-            ],
-            dim=1,
-        )
-
-        return prompts
-    '''
-
     def forward(self, im_features):
-        prefix = self.token_prefix
-        suffix = self.token_suffix
-        ctx = self.ctx                     # (n_ctx, ctx_dim)
-        bias = self.meta_net(im_features)  # (batch, ctx_dim)
-        bias = bias.unsqueeze(1)           # (batch, 1, ctx_dim)
-        ctx = ctx.unsqueeze(0)             # (1, n_ctx, ctx_dim)
-        ctx_shifted = ctx + bias           # (batch, n_ctx, ctx_dim)
+        bias = self.meta_net(im_features) #(batch, ctx_dim)
+        bias = bias.unsqueeze(1) #(batch, 1, ctx_dim)
+        if self.ctx_beforename is not None:
+            ctx_beforename_shifted = self.ctx_beforename.unsqueeze(0) + bias
         
-        # Use instance-conditioned context tokens for all classes
+        if self.ctx_aftername is not None:
+            ctx_aftername_shifted = self.ctx_aftername.unsqueeze(0) + bias
+
         prompts = []
-        for ctx_shifted_i in ctx_shifted:
-            ctx_i = ctx_shifted_i.unsqueeze(0).expand(self.n_cls, -1, -1)
-            pts_i = self.construct_prompts(ctx_i, prefix, suffix)  # (n_cls, n_tkn, ctx_dim)
+        for i in range(im_features.shape[0]):
+            ctx_beforename_i = None
+            if self.ctx_beforename is not None:
+                ctx_beforename_i = ctx_beforename_shifted[i,:,:]
+            
+            ctx_aftername_i = None
+            if self.ctx_aftername is not None:
+                ctx_aftername_i = ctx_aftername_shifted[i,:,:]
+
+            pts_i = self.construct_prompts(ctx_beforename_i, ctx_aftername_i)
+            assert(pts_i.shape[0] == self.n_cls)
             prompts.append(pts_i)
+
         prompts = torch.stack(prompts)
         
         return prompts
@@ -207,7 +226,13 @@ class PromptLearner(nn.Module):
 class CustomCLIP(nn.Module):
     def __init__(self, cfg, classnames, clip_model, return_attn_probs):
         super().__init__()
-        self.prompt_learner = PromptLearner(cfg, classnames, clip_model, cfg.TRAINER.COCOOP.N_CTX, cfg.TRAINER.COCOOP.CTX_INIT)
+        assert(cfg.TRAINER.COCOOP.N_CTX > 0)
+        ctx_init_beforename = cfg.TRAINER.COCOOP.CTX_INIT
+        ctx_init_aftername = ''
+        if ctx_init_beforename == '':
+            ctx_init_beforename, ctx_init_aftername = None, None
+
+        self.prompt_learner = PromptLearner(cfg, classnames, clip_model, (cfg.TRAINER.COCOOP.N_CTX, 0), (ctx_init_beforename, ctx_init_aftername))
         self.tokenized_prompts = self.prompt_learner.tokenized_prompts
         self.image_encoder = clip_model.visual
         self.return_attn_probs = return_attn_probs

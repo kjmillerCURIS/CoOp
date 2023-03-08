@@ -71,22 +71,46 @@ class TextEncoder(nn.Module):
 
         return x
 
-#returns a list of (n_ctx, ctx_init) pairs
-#if random prompt is to be used, then ctx_init will be None, else it will be a string (I think...)
+#returns a list of (n_ctx_pair, ctx_init_pair) pairs (i.e. returns a list of pairs of pairs)
+#if a random prompt is to be used, then both members of ctx_init_pair shall be None
 def get_ctx_inits(cfg):
     templates = IMAGENET_TEMPLATES_SELECT
     if cfg.DATASET.NAME != "ImageNet":
         templates += [CUSTOM_TEMPLATES[cfg.DATASET.NAME]]
 
+    outputs = []
     for template in templates
-    assert(False) #KEVIN
+        assert(template[-1] == '.')
+        assert('{}' in template)
+        parts = template[:-1].split('{}')
+        assert(len(parts) == 2)
+        n_ctx_pair = []
+        ctx_init_pair = []
+        for part in parts:
+            part = part.strip()
+            
+            #deal with n_ctx details
+            if part == '':
+                n_ctx_pair.append(0)
+            else:
+                n_ctx_pair.append(len(part.split(' ')))
+
+            #deal with ctx_init details
+            if cfg.TRAINER.COCOOP_ENSEMBLE.RANDOM_CTX_INIT:
+                ctx_init_pair.append(None)
+            else:
+                ctx_init_pair.append(part)
+
+        outputs.append((tuple(n_ctx_pair), tuple(ctx_init_pair)))
+
+    return outputs
 
 class CustomCLIPEnsembling(nn.Module):
     def __init__(self, cfg, classnames, clip_model):
         super().__init__()
         self.prompt_learner_list = []
-        for n_ctx, ctx_init in get_ctx_inits(cfg):
-            pl = PromptLearner(cfg, classnames, clip_model, n_ctx, ctx_init)
+        for n_ctx_pair, ctx_init_pair in get_ctx_inits(cfg):
+            pl = PromptLearner(cfg, classnames, clip_model, n_ctx_pair, ctx_init_pair)
             self.prompt_learner_list.append(pl)
 
         self.prompt_learner_list = nn.ModuleList(self.prompt_learner_list)
@@ -160,9 +184,8 @@ class CustomCLIPEnsembling(nn.Module):
 #@TRAINER_REGISTRY.register()
 class CoCoOpEnsembling(TrainerX):
     
-    def __init__(self, cfg, train_or_test, fewshot_seed, domain_split_index, class_split_type, eval_type, record_attentropy=False):
+    def __init__(self, cfg, train_or_test, fewshot_seed, domain_split_index, class_split_type, eval_type):
         assert(train_or_test in ['train', 'test'])
-        self.record_attentropy = record_attentropy
         
         #stuff from TrainerBase.__init__()
         self._models = OrderedDict()
@@ -211,7 +234,7 @@ class CoCoOpEnsembling(TrainerX):
         self.dm = dm
     
     def check_cfg(self, cfg):
-        assert cfg.TRAINER.COCOOP.PREC in ["fp16", "fp32", "amp"]
+        assert cfg.TRAINER.COCOOP_ENSEMBLING.PREC in ["fp16", "fp32", "amp"]
 
     def build_model(self, train_or_test):
         assert(train_or_test in ['train', 'test'])
@@ -221,12 +244,12 @@ class CoCoOpEnsembling(TrainerX):
         print(f"Loading CLIP (backbone: {cfg.MODEL.BACKBONE.NAME})")
         clip_model = load_clip_to_cpu(cfg)
         
-        if cfg.TRAINER.COCOOP.PREC == "fp32" or cfg.TRAINER.COCOOP.PREC == "amp":
+        if cfg.TRAINER.COCOOP_ENSEMBLING.PREC == "fp32" or cfg.TRAINER.COCOOP_ENSEMBLING.PREC == "amp":
             # CLIP's default precision is fp16
             clip_model.float()
 
         print("Building custom CLIP")
-        self.model = CustomCLIPEnsembling(cfg, classnames, clip_model, (train_or_test == 'test' and self.record_attentropy)) #training-vs-testing-classnames problem has already been taken care of
+        self.model = CustomCLIPEnsembling(cfg, classnames, clip_model) #training-vs-testing-classnames problem has already been taken care of
 
         print("Turning off gradients in both the image and the text encoder")
         name_to_update = "prompt_learner"
@@ -251,7 +274,7 @@ class CoCoOpEnsembling(TrainerX):
         self.sched = build_lr_scheduler(self.optim, cfg.OPTIM)
         self.register_model("prompt_learner", self.model.prompt_learner, self.optim, self.sched)
 
-        self.scaler = GradScaler() if cfg.TRAINER.COCOOP.PREC == "amp" else None
+        self.scaler = GradScaler() if cfg.TRAINER.COCOOP_ENSEMBLING.PREC == "amp" else None
 
         # Note that multi-gpu training could be slow because CLIP's size is
         # big, which slows down the copy operation in DataParallel
@@ -266,17 +289,18 @@ class CoCoOpEnsembling(TrainerX):
         model = self.model
         optim = self.optim
         scaler = self.scaler
+        train_separately = self.cfg.TRAINER.COCOOP_ENSEMBLING.TRAIN_SEPARATELY
         
-        prec = self.cfg.TRAINER.COCOOP.PREC
+        prec = self.cfg.TRAINER.COCOOP_ENSEMBLING.PREC
         if prec == "amp":
             with autocast():
-                loss = model(image, label)
+                loss = model(image, label, train_separately=train_separately)
             optim.zero_grad()
             scaler.scale(loss).backward()
             scaler.step(optim)
             scaler.update()
         else:
-            loss = model(image, label)
+            loss = model(image, label, train_separately=train_separately)
             optim.zero_grad()
             loss.backward()
             optim.step()
@@ -350,30 +374,11 @@ class CoCoOpEnsembling(TrainerX):
 
         for batch_idx, batch in enumerate(tqdm(data_loader)):
             input, label, domain = self.parse_batch_test(batch)
-            if self.record_attentropy:
-                output, attn_probs = self.model(input)
-                assert(len(attn_probs.shape) == 3)
-                assert(attn_probs.shape[0] == input.shape[0])
-                assert(attn_probs.shape[1] == self.num_classes_test)
-                attn_probs = torch.clamp(attn_probs, min=1e-8)
-                attentropies = torch.sum(-attn_probs * torch.log(attn_probs), dim=2)
-                correct_attentropy = attentropies[torch.arange(attentropies.shape[0]), label].cpu().numpy()
-                pred_attentropy = attentropies[torch.arange(attentropies.shape[0]), output.argmax(dim=1)].cpu().numpy()
-                avg_attentropy = torch.mean(attentropies, dim=1).cpu().numpy()
-                attentropies = attentropies.cpu().numpy()
-            else:
-                output = self.model(input)
-
+            output = self.model(input)
             self.evaluator.process(output, label, domain)
             test_loss = F.cross_entropy(output, label, reduce=False, reduction='none')
             for i, impath in enumerate(batch['impath']):
                 detail = {'test_loss': test_loss[i].item()}
-                if self.record_attentropy:
-                    detail['attentropies'] = attentropies[i,:]
-                    detail['correct_attentropy'] = correct_attentropy[i]
-                    detail['pred_attentropy'] = pred_attentropy[i]
-                    detail['avg_attentropy'] = avg_attentropy[i]
-
                 details[impath] = detail
 
         results = self.evaluator.evaluate()
