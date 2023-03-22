@@ -15,7 +15,7 @@ python train.py \
 --root ../vislang-domain-exploration-data/DatasetsForCoCoOp \
 --seed ${SEED} \
 --dataset-config-file configs/datasets/domainnet_custom.yaml \
---config-file configs/trainers/custom/CoCoOp_baseline.yaml \
+--config-file configs/trainers/custom/CoCoOpAttentropy_lambda${ATTENTROPY_LAMBDA}_baseline.yaml \
 --output-dir ${OUTPUT_DIR} \
 --resume ${OUTPUT_DIR} \
 --class-split-type ${CLASS_SPLIT_TYPE} \

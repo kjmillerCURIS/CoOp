@@ -1,7 +1,7 @@
 import os
 import sys
 
-DEBUG=False
+DEBUG=True
 #JOB_NAME_FILTER = ['CoCoOp_train_ds3_csrandom', 'CoCoOp_train_ds4_csrandom', 'CoCoOp_train_ds5_csrandom', 'CoCoOp_train_ds0_csordered', 'CoCoOp_train_ds1_csordered', 'CoCoOp_train_ds2_csordered', 'CoCoOp_train_ds3_csordered', 'CoCoOp_train_ds4_csordered']
 JOB_NAME_FILTER = None
 
@@ -9,9 +9,12 @@ def submit_CoCoOp_training_runs():
     for class_split_type in ['random', 'ordered']:
         for seed in [0]:
             fewshot_seed = seed
-            for domain_split_index in range(6):
-                output_dir = '../vislang-domain-exploration-data/CoCoOpExperiments/baselines/CoCoOp/class_split_%s/fewshot_seed%d/seed%d/domain_split%d/train'%(class_split_type, fewshot_seed, seed, domain_split_index)
-                job_name = 'CoCoOp_train_ds%d_cs%s'%(domain_split_index, class_split_type)
+#            for domain_split_index in range(6):
+#            for domain_split_index in [5]:
+            for domain_split_index in [0]:
+#                output_dir = '../vislang-domain-exploration-data/CoCoOpExperiments/baselines/CoCoOp/class_split_%s/fewshot_seed%d/seed%d/domain_split%d/train'%(class_split_type, fewshot_seed, seed, domain_split_index)
+                output_dir = '../vislang-domain-exploration-data/CoCoOpExperiments/baselines/CoCoOp_SANITYSANITY/class_split_%s/fewshot_seed%d/seed%d/domain_split%d/train'%(class_split_type, fewshot_seed, seed, domain_split_index)
+                job_name = 'CoCoOpDETERMINISM_train_ds%d_cs%s'%(domain_split_index, class_split_type)
                 if JOB_NAME_FILTER is not None:
                     if job_name not in JOB_NAME_FILTER:
                         continue

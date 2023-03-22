@@ -92,3 +92,13 @@ IMAGENET_TEMPLATES_SELECT = [
     "art of the {}.",
     "a photo of the small {}.",
 ]
+
+IMAGENET_TEMPLATES_SELECT_ONETOKEN = [
+    "dslr {}.", #trying to approximate "itap", which is 2 tokens. "itap" means "i took a picture" and comes reddit.com/r/itookapicture, which has the kinds of pictures a photographer would take
+    "bad {}.",
+    "origami {}.",
+    "large {}.",
+    "videogame {}.",
+    "art {}.",
+    "small {}.",
+]

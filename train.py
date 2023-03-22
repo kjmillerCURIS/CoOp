@@ -105,6 +105,19 @@ def extend_cfg(cfg):
     cfg.TRAINER.COCOOP.N_CTX = 16  # number of context vectors
     cfg.TRAINER.COCOOP.CTX_INIT = ""  # initialization words
     cfg.TRAINER.COCOOP.PREC = "fp16"  # fp16, fp32, amp
+    
+    cfg.TRAINER.COCOOP_ENSEMBLING = CN()
+    cfg.TRAINER.COCOOP_ENSEMBLING.PREC = "fp16"  # fp16, fp32, amp
+    cfg.TRAINER.COCOOP_ENSEMBLING.RANDOM_CTX_INIT = False
+    cfg.TRAINER.COCOOP_ENSEMBLING.TRAIN_SEPARATELY = False
+    cfg.TRAINER.COCOOP_ENSEMBLING.ONETOKEN = False
+    cfg.TRAINER.COCOOP_ENSEMBLING.NOPERIOD = False
+
+    cfg.TRAINER.COCOOP_ATTENTROPY = CN()
+    cfg.TRAINER.COCOOP_ATTENTROPY.N_CTX = 16  # number of context vectors
+    cfg.TRAINER.COCOOP_ATTENTROPY.CTX_INIT = ""  # initialization words
+    cfg.TRAINER.COCOOP_ATTENTROPY.PREC = "fp16"  # fp16, fp32, amp
+    cfg.TRAINER.COCOOP_ATTENTROPY.ATTENTROPY_LAMBDA = 1.0
 
     #the CoOp and CoCoOp authors decided to use fp16, while the CLIP-Adapter authors decided to use fp32, so that's what we're doing for now
     cfg.TRAINER.CLIPADAPTER = CN()
@@ -112,6 +125,9 @@ def extend_cfg(cfg):
 
     #default CLIP_Adapter to use 0.2 as the authors did for ImageNet
     cfg.TRAINER.CLIPADAPTER.ALPHA = 0.2
+
+    cfg.TRAINER.ZEROSHOTCLIP2 = CN()
+    cfg.TRAINER.ZEROSHOTCLIP2.ONETOKEN = False
 
 #    cfg.DATASET.SUBSAMPLE_CLASSES = "all"  # all, base or new
 
@@ -125,6 +141,7 @@ def extend_cfg(cfg):
     cfg.DATASET.FEWSHOT_FILTER_PATHS = ''
     cfg.DATASET.CLASS_SPLIT_PATHS = ''
 
+    cfg.TRAIN.CHECKPOINT_FREQ = 1
 
 def setup_cfg(args):
     cfg = get_cfg_default()

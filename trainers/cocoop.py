@@ -29,6 +29,9 @@ from .exposed_text_encoder import ExposedTextEncoder
 _tokenizer = _Tokenizer()
 
 
+PRINT_INIT = True
+
+
 def load_clip_to_cpu(cfg):
     backbone_name = cfg.MODEL.BACKBONE.NAME
     url = clip._MODELS[backbone_name]
@@ -74,12 +77,13 @@ class TextEncoder(nn.Module):
 #note that "EOS" is the one that becomes the text embedding (you might've also called it the "CLS token" in your head)
 class PromptLearner(nn.Module):
     
-    #n_ctx and ctx_init should both be pairs
-    #use empty strings for empty context, and None for random init (BOTH must be None)
-    def __init__(self, cfg, classnames, clip_model, n_ctx, ctx_init):
+    #random_or_manual should be 'random' if we initialize our prompts randomly, 'manual' if we use manual intiialization
+    #if 'random' then n_ctx_or_ctx_init should be a pair of numbers
+    #if 'manual' then n_ctx_or_ctx_init should be a pair of strings
+    def __init__(self, cfg, classnames, clip_model, random_or_manual, n_ctx_or_ctx_init, prec='fp16', noperiod=False):
         super().__init__()
-        n_ctx_beforename, n_ctx_aftername = n_ctx
-        ctx_init_beforename, ctx_init_aftername = ctx_init
+        
+        #standard setup stuff
         n_cls = len(classnames)
         dtype = clip_model.dtype
         ctx_dim = clip_model.ln_final.weight.shape[0]
@@ -88,13 +92,31 @@ class PromptLearner(nn.Module):
         cfg_imsize = cfg.INPUT.SIZE[0]
         assert cfg_imsize == clip_imsize, f"cfg_imsize ({cfg_imsize}) must equal to clip_imsize ({clip_imsize})"
 
-        if ctx_init_beforename or ctx_init_aftername:
-            assert(ctx_init_beforename is not None and ctx_init_aftername is not None)
-            # use given words to initialize context vectors
-            ctx_init_beforename = ctx_init_beforename.replace('_', ' ')
-            ctx_init_aftername = ctx_init_aftername.replace('_', ' ')
-            assert(len(ctx_init_beforename.split(' ')) * int(ctx_init_beforename != '') == n_ctx_beforename)
-            assert(len(ctx_init_aftername.split(' ')) * int(ctx_init_aftername != '') == n_ctx_aftername)
+        #figure out ctx stuff
+        assert(random_or_manual in ['random', 'manual'])
+        if random_or_manual == 'random':
+            n_ctx_beforename, n_ctx_aftername = n_ctx_or_ctx_init
+            if n_ctx_beforename > 0:
+                ctx_vectors = torch.empty(n_ctx_beforename, ctx_dim, dtype=dtype)
+                nn.init.normal_(ctx_vectors, std=0.02)
+                self.ctx_beforename = nn.Parameter(ctx_vectors)
+                prompt_filler_beforename = ' '.join(['X'] * n_ctx_beforename) + ' '
+            else:
+                self.ctx_beforename = None
+                prompt_filler_beforename = ''
+            
+            if n_ctx_aftername > 0:
+                ctx_vectors = torch.empty(n_ctx_aftername, ctx_dim, dtype=dtype)
+                nn.init.normal_(ctx_vectors, std=0.02)
+                self.ctx_aftername = nn.Parameter(ctx_vectors)
+                prompt_filler_aftername = ' ' + ' '.join(['X'] * n_ctx_aftername)
+            else:
+                self.ctx_aftername = None
+                prompt_filler_aftername = ''
+        elif random_or_manual == 'manual':
+            ctx_init_beforename, ctx_init_aftername = n_ctx_or_ctx_init
+            n_ctx_beforename = len(_tokenizer.encode(ctx_init_beforename))
+            n_ctx_aftername = len(_tokenizer.encode(ctx_init_aftername))
             if ctx_init_beforename != '':
                 prompt = clip.tokenize(ctx_init_beforename)
                 with torch.no_grad():
@@ -118,27 +140,13 @@ class PromptLearner(nn.Module):
             else:
                 self.ctx_aftername = None
                 prompt_filler_aftername = ''
-        
         else:
-            assert(ctx_init_beforename is None and ctx_init_aftername is None)
-            # random initialization
-            if n_ctx_beforename > 0:
-                ctx_vectors = torch.empty(n_ctx_beforename, ctx_dim, dtype=dtype)
-                nn.init.normal_(ctx_vectors, std=0.02)
-                self.ctx_beforename = nn.Parameter(ctx_vectors)
-                prompt_filler_beforename = ' '.join(['X'] * n_ctx_beforename) + ' '
-            else:
-                self.ctx_beforename = None
-                prompt_filler_beforename = ''
-            
-            if n_ctx_aftername > 0:
-                ctx_vectors = torch.empty(n_ctx_aftername, ctx_dim, dtype=dtype)
-                nn.init.normal_(ctx_vectors, std=0.02)
-                self.ctx_aftername = nn.Parameter(ctx_vectors)
-                prompt_filler_aftername = ' ' + ' '.join(['X'] * n_ctx_aftername)
-            else:
-                self.ctx_aftername = None
-                prompt_filler_aftername = ''
+            assert(False)
+
+
+        if PRINT_INIT:
+            print('CTX_BEFORENAME INIT:')
+            print(str(self.ctx_beforename[0,0].item()))
 
         print(f'Initial contexts: "{prompt_filler_beforename}", "{prompt_filler_aftername}"')
         print(f"Number of context words (tokens): {n_ctx_beforename}, {n_ctx_aftername}")
@@ -149,22 +157,31 @@ class PromptLearner(nn.Module):
             ("linear2", nn.Linear(vis_dim // 16, ctx_dim))
         ]))
         
-        if cfg.TRAINER.COCOOP.PREC == "fp16":
+        if prec == "fp16":
             self.meta_net.half()
+
+        if PRINT_INIT:
+            print('METANET INIT:')
+            print(str(self.meta_net.linear1.weight[0,0].item()))
 
         classnames = [name.replace("_", " ") for name in classnames]
         name_lens = [len(_tokenizer.encode(name)) for name in classnames]
-        prompts = [prompt_filler_beforename + name + prompt_filler_aftername + '.' for name in classnames]
+        period = '.'
+        if noperiod:
+            period = ''
+
+        prompts = [prompt_filler_beforename + name + prompt_filler_aftername + period for name in classnames]
         tokenized_prompts = torch.cat([clip.tokenize(p) for p in prompts])  # (n_cls, n_tkn)
         with torch.no_grad():
             embedding = clip_model.token_embedding(tokenized_prompts).type(dtype)
 
-        #have to store things as lists because some class names might have different numbers of tokens, so parts might have different lengths
-        self.start_parts, self.name_parts, self.end_parts = [], [], []
-        for i, name, name_len in enumerate(zip(classnames, name_lens)):
-            self.start_parts.append(embedding[i, :1, :]) #SOS token
-            self.name_parts.append(embedding[i, 1+n_ctx_beforename:1+n_ctx_beforename+name_len, :]) #classname tokens
-            self.end_parts.append(embedding[i, 1+n_ctx_beforename+name_len+n_ctx_aftername:, :]) #period and EOS and padding
+        #have to store things separately because some class names might have different numbers of tokens, so parts might have different lengths
+        #these will be saved (not sure if that's useful) but they won't be loaded
+        #I think the only use of this is to automatically put them on GPU when PromptLearner is put on GPU, and maybe ditto for dtype
+        for i, (name, name_len) in enumerate(zip(classnames, name_lens)):
+            self.register_buffer('DONOTLOAD_start_part_%d'%(i), embedding[i, :1, :]) #SOS token
+            self.register_buffer('DONOTLOAD_name_part_%d'%(i), embedding[i, 1+n_ctx_beforename:1+n_ctx_beforename+name_len, :]) #classname tokens
+            self.register_buffer('DONOTLOAD_end_part_%d'%(i), embedding[i, 1+n_ctx_beforename+name_len+n_ctx_aftername:, :]) #period and EOS and padding
 
         self.n_cls = n_cls
         self.n_ctx_beforename = n_ctx_beforename
@@ -177,10 +194,14 @@ class PromptLearner(nn.Module):
         #ctx_beforename should have shape (n_ctx_beforename, ctx_dim)
         #ctx_aftername should have shape (n_ctx_aftername, ctx_dim)
         #self.start_parts, self.name_parts, self.end_parts will be lists of (*, ctx_dim) tensors
-        #self.end_parts would have the period and the EOS token, and a bunch of padding (which the transformer will ignore cuz it's causal)
+        #self.end_parts would have the period (if used) and the EOS token, and a bunch of padding (which the transformer will ignore cuz it's causal)
 
         prompts = []
-        for start_part, name_part, end_part in zip(self.start_parts, self.name_parts, self.end_parts):
+        for i in range(self.n_cls):
+            start_part = self._buffers['DONOTLOAD_start_part_%d'%(i)]
+            name_part = self._buffers['DONOTLOAD_name_part_%d'%(i)]
+            end_part = self._buffers['DONOTLOAD_end_part_%d'%(i)]
+            
             items = [start_part]
             if ctx_beforename is not None:
                 items.append(ctx_beforename)
@@ -224,15 +245,18 @@ class PromptLearner(nn.Module):
 
 
 class CustomCLIP(nn.Module):
-    def __init__(self, cfg, classnames, clip_model, return_attn_probs):
+    def __init__(self, cfg, algo_cfg, classnames, clip_model, return_attn_probs):
         super().__init__()
-        assert(cfg.TRAINER.COCOOP.N_CTX > 0)
-        ctx_init_beforename = cfg.TRAINER.COCOOP.CTX_INIT
-        ctx_init_aftername = ''
-        if ctx_init_beforename == '':
-            ctx_init_beforename, ctx_init_aftername = None, None
+        assert(algo_cfg.N_CTX > 0)
+        random_or_manual = 'manual'
+        n_ctx_or_ctx_init = (algo_cfg.CTX_INIT, '')
+        if algo_cfg.CTX_INIT == '':
+            random_or_manual = 'random'
+            n_ctx_or_ctx_init = (algo_cfg.N_CTX, 0)
+        else:
+            assert('_' not in algo_cfg.CTX_INIT)
 
-        self.prompt_learner = PromptLearner(cfg, classnames, clip_model, (cfg.TRAINER.COCOOP.N_CTX, 0), (ctx_init_beforename, ctx_init_aftername))
+        self.prompt_learner = PromptLearner(cfg, classnames, clip_model, random_or_manual, n_ctx_or_ctx_init, prec=algo_cfg.PREC)
         self.tokenized_prompts = self.prompt_learner.tokenized_prompts
         self.image_encoder = clip_model.visual
         self.return_attn_probs = return_attn_probs
@@ -275,7 +299,10 @@ class CustomCLIP(nn.Module):
             attn_probs = torch.stack(attn_probs) #should be (batch_size, num_classes, seq_len)
 
         if self.prompt_learner.training:
-            return F.cross_entropy(logits, label)
+            if self.return_attn_probs:
+                return F.cross_entropy(logits, label), attn_probs
+            else:
+                return F.cross_entropy(logits, label)
         
         if self.return_attn_probs:
             return logits, attn_probs
@@ -352,7 +379,7 @@ class CoCoOp(TrainerX):
             clip_model.float()
 
         print("Building custom CLIP")
-        self.model = CustomCLIP(cfg, classnames, clip_model, (train_or_test == 'test' and self.record_attentropy)) #training-vs-testing-classnames problem has already been taken care of
+        self.model = CustomCLIP(cfg, cfg.TRAINER.COCOOP, classnames, clip_model, (train_or_test == 'test' and self.record_attentropy)) #training-vs-testing-classnames problem has already been taken care of
 
         print("Turning off gradients in both the image and the text encoder")
         name_to_update = "prompt_learner"
@@ -450,6 +477,10 @@ class CoCoOp(TrainerX):
 
             if "token_suffix" in state_dict:
                 del state_dict["token_suffix"]
+
+            for k in sorted(state_dict.keys()):
+                if 'DONOTLOAD' in k:
+                    del state_dict[k]
 
             print("Loading weights to {} " 'from "{}" (epoch = {})'.format(name, model_path, epoch))
             # set strict=False

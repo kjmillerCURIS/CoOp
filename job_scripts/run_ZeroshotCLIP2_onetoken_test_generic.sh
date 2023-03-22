@@ -1,10 +1,10 @@
 #!/bin/bash -l
 
 #$ -P ivc-ml
-#$ -pe omp 2
+#$ -pe omp 3
 #$ -l gpus=1
-#$ -l gpu_c=5.0
-#$ -l h_rt=11:59:59
+#$ -l gpu_c=7.0
+#$ -l h_rt=5:59:59
 #$ -j y
 #$ -m ea
 
@@ -15,9 +15,11 @@ python train.py \
 --root ../vislang-domain-exploration-data/DatasetsForCoCoOp \
 --seed ${SEED} \
 --dataset-config-file configs/datasets/domainnet_custom.yaml \
---config-file configs/trainers/custom/CoCoOp_baseline.yaml \
+--config-file configs/trainers/custom/ZeroshotCLIP2_onetoken_baseline.yaml \
 --output-dir ${OUTPUT_DIR} \
---resume ${OUTPUT_DIR} \
 --class-split-type ${CLASS_SPLIT_TYPE} \
 --fewshot-seed ${FEWSHOT_SEED} \
---domain-split-index ${DOMAIN_SPLIT_INDEX}
+--domain-split-index ${DOMAIN_SPLIT_INDEX} \
+--eval-only \
+--eval-type ${EVAL_TYPE}
+

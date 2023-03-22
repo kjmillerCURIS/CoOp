@@ -17,7 +17,7 @@ def load_results(experiment_dir):
 
     return agg_results
 
-def tablify_results(experiment_dirs, table_prefix, comparison_experiment_dir=None):
+def tablify_results_for_3_01_2023_update(experiment_dirs, table_prefix, comparison_experiment_dir=None):
     experiment_dirs = experiment_dirs.split(',')
     if comparison_experiment_dir is not None:
         comparison_results = load_results(comparison_experiment_dir)
@@ -53,7 +53,7 @@ def tablify_results(experiment_dirs, table_prefix, comparison_experiment_dir=Non
         f.close()
 
 def usage():
-    print('Usage: python tablify_results.py <experiment_dirs> <table_prefix> [<comparison_experiment_dir>=None]')
+    print('Usage: python tablify_results_for_3_01_2023_update.py <experiment_dirs> <table_prefix> [<comparison_experiment_dir>=None]')
 
 if __name__ == '__main__':
-    tablify_results(*(sys.argv[1:]))
+    tablify_results_for_3_01_2023_update(*(sys.argv[1:]))

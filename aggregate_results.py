@@ -5,7 +5,7 @@ import pickle
 import pprint
 from tqdm import tqdm
 
-ZEROSHOT_METHODS = ['ZeroshotCLIP', 'ZeroshotCLIP2']
+ZEROSHOT_METHODS = ['ZeroshotCLIP', 'ZeroshotCLIP2', 'ZeroshotCLIP2_onetoken']
 
 #NOTE: you can only do this if you have regular domain-splits!
 def duplicate_for_zeroshot(agg_results):
@@ -22,10 +22,12 @@ def duplicate_for_zeroshot(agg_results):
 #this script will write its output to experiment_base_dir/agg_results.pkl
 def aggregate_results(experiment_base_dir):
     is_zeroshot = (os.path.basename(experiment_base_dir) in ZEROSHOT_METHODS)
-    print('Zeroshot method detected! Will only compute "unseen_domains" settings and then copy them over to "seen_domains" settings when displaying (but will only save the "unseen_domains" results')
+    if is_zeroshot:
+        print('Zeroshot method detected! Will only compute "unseen_domains" settings and then copy them over to "seen_domains" settings when displaying (but will only save the "unseen_domains" results')
 
     agg_results = {}
-    for class_split_type in ['random', 'ordered']:
+#    for class_split_type in ['random', 'ordered']:
+    for class_split_type in ['random']:
         agg_results[class_split_type] = {}
         for seed in [0]:
             fewshot_seed = seed

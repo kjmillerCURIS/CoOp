@@ -19,7 +19,7 @@ from data_manager_custom import DataManagerCustom
 from custom_classification_evaluator import CustomClassificationEvaluator
 
 from .coop import load_clip_to_cpu
-from .imagenet_templates import IMAGENET_TEMPLATES, IMAGENET_TEMPLATES_SELECT
+from .imagenet_templates import IMAGENET_TEMPLATES, IMAGENET_TEMPLATES_SELECT, IMAGENET_TEMPLATES_SELECT_ONETOKEN
 
 import time
 import datetime
@@ -46,6 +46,8 @@ CUSTOM_TEMPLATES = {
     "ImageNetA": "a photo of a {}.",
     "ImageNetR": "a photo of a {}.",
 }
+
+CUSTOM_TEMPLATES_ONETOKEN = {"DomainNetCustom": "photo {}."}
 
 class ExposedTextEncoder(nn.Module):
     def __init__(self, clip_model):
@@ -231,9 +233,15 @@ class ZeroshotCLIP2(ZeroshotCLIP):
         for params in clip_model.parameters():
             params.requires_grad_(False)
 
+        if self.cfg.TRAINER.ZEROSHOTCLIP2.ONETOKEN:
+            self.templates = IMAGENET_TEMPLATES_SELECT_ONETOKEN
+
         # add custom-made prompt
         if cfg.DATASET.NAME != "ImageNet":
-            self.templates += [CUSTOM_TEMPLATES[cfg.DATASET.NAME]]
+            if self.cfg.TRAINER.ZEROSHOTCLIP2.ONETOKEN:
+                self.templates += [CUSTOM_TEMPLATES_ONETOKEN[cfg.DATASET.NAME]]
+            else:
+                self.templates += [CUSTOM_TEMPLATES[cfg.DATASET.NAME]]
 
         num_temp = len(self.templates)
         print(f"Prompt ensembling (n={num_temp})")

@@ -25,11 +25,14 @@ import datetime
 from tqdm import tqdm
 
 from .cocoop import PromptLearner
-from .imagenet_templates import IMAGENET_TEMPLATES_SELECT
-from .zsclip import CUSTOM_TEMPLATES
+from .imagenet_templates import IMAGENET_TEMPLATES_SELECT, IMAGENET_TEMPLATES_SELECT_ONETOKEN
+from .zsclip import CUSTOM_TEMPLATES, CUSTOM_TEMPLATES_ONETOKEN
+
+from write_to_log_file import write_to_log_file
 
 _tokenizer = _Tokenizer()
 
+LOW_MEMORY_MODE = True
 
 def load_clip_to_cpu(cfg):
     backbone_name = cfg.MODEL.BACKBONE.NAME
@@ -71,37 +74,35 @@ class TextEncoder(nn.Module):
 
         return x
 
-#returns a list of (n_ctx_pair, ctx_init_pair) pairs (i.e. returns a list of pairs of pairs)
-#if a random prompt is to be used, then both members of ctx_init_pair shall be None
+#returns a list of pairs
+#if random initialization, then it's a pair of numbers specifying number of tokens before and after class name
+#if manual initialization, then it's a pair of strings specifying the initial state before and after class name
 def get_ctx_inits(cfg):
     templates = IMAGENET_TEMPLATES_SELECT
+    custom = CUSTOM_TEMPLATES
+    if cfg.TRAINER.COCOOP_ENSEMBLING.ONETOKEN:
+        templates = IMAGENET_TEMPLATES_SELECT_ONETOKEN
+        custom = CUSTOM_TEMPLATES_ONETOKEN
+
     if cfg.DATASET.NAME != "ImageNet":
-        templates += [CUSTOM_TEMPLATES[cfg.DATASET.NAME]]
+        templates += [custom[cfg.DATASET.NAME]]
 
     outputs = []
-    for template in templates
+    for template in templates:
+        assert('_' not in template)
         assert(template[-1] == '.')
         assert('{}' in template)
         parts = template[:-1].split('{}')
         assert(len(parts) == 2)
-        n_ctx_pair = []
-        ctx_init_pair = []
+        n_ctx_or_ctx_init = []
         for part in parts:
             part = part.strip()
-            
-            #deal with n_ctx details
-            if part == '':
-                n_ctx_pair.append(0)
-            else:
-                n_ctx_pair.append(len(part.split(' ')))
+            if cfg.TRAINER.COCOOP_ENSEMBLING.RANDOM_CTX_INIT: #if random then put number of tokens
+                n_ctx_or_ctx_init.append(len(_tokenizer.encode(part)))
+            else: #if manual then put actual string
+                n_ctx_or_ctx_init.append(part)
 
-            #deal with ctx_init details
-            if cfg.TRAINER.COCOOP_ENSEMBLE.RANDOM_CTX_INIT:
-                ctx_init_pair.append(None)
-            else:
-                ctx_init_pair.append(part)
-
-        outputs.append((tuple(n_ctx_pair), tuple(ctx_init_pair)))
+        outputs.append(tuple(n_ctx_or_ctx_init))
 
     return outputs
 
@@ -109,12 +110,12 @@ class CustomCLIPEnsembling(nn.Module):
     def __init__(self, cfg, classnames, clip_model):
         super().__init__()
         self.prompt_learner_list = []
-        for n_ctx_pair, ctx_init_pair in get_ctx_inits(cfg):
-            pl = PromptLearner(cfg, classnames, clip_model, n_ctx_pair, ctx_init_pair)
+        random_or_manual = {True : 'random', False : 'manual'}[cfg.TRAINER.COCOOP_ENSEMBLING.RANDOM_CTX_INIT]
+        for n_ctx_or_ctx_init in get_ctx_inits(cfg):
+            pl = PromptLearner(cfg, classnames, clip_model, random_or_manual, n_ctx_or_ctx_init, prec=cfg.TRAINER.COCOOP_ENSEMBLING.PREC, noperiod=cfg.TRAINER.COCOOP_ENSEMBLING.NOPERIOD)
             self.prompt_learner_list.append(pl)
 
         self.prompt_learner_list = nn.ModuleList(self.prompt_learner_list)
-        self.tokenized_prompts = self.prompt_learner.tokenized_prompts
         self.image_encoder = clip_model.visual
         self.text_encoder = TextEncoder(clip_model)
         self.logit_scale = clip_model.logit_scale #I don't think this ever gets updated, because it wouldn't have "prompt_learner" in its name
@@ -125,7 +126,7 @@ class CustomCLIPEnsembling(nn.Module):
     #returns normalized text features for whole batch
     #text_features will have shape (N, C, D) where C is number of classes
     def __compute_text_features(self, image_features, pl):
-        tokenized_prompts = self.tokenized_prompts
+        tokenized_prompts = pl.tokenized_prompts
         (N, D) = image_features.shape
         C = tokenized_prompts.shape[0]
         prompts = pl(image_features)
@@ -140,16 +141,52 @@ class CustomCLIPEnsembling(nn.Module):
         return all_text_features
 
     def forward(self, image, label=None, train_separately=False):
-        logit_scale = self.logit_scale.exp()
-
+        #Kevin's Note: Why on earth don't they do torch.no_grad??? Or is there a no_grad that I'm not aware of???
+        #(but there's no point in changing it when it's a batch-size of 1)
         image_features = self.image_encoder(image.type(self.dtype))
         image_features = image_features / image_features.norm(dim=-1, keepdim=True)
-
         text_features_list = []
         for pl in self.prompt_learner_list:
-            text_features = self.__compute_text_features(image_features, pl)
+            if LOW_MEMORY_MODE and self.prompt_learner_list[0].training: #this is just the first pass - we'll do this again
+                with torch.no_grad():
+                    text_features = self.__compute_text_features(image_features, pl)
+
+                text_features.requires_grad = True
+            else:
+                text_features = self.__compute_text_features(image_features, pl)
+            
             text_features_list.append(text_features)
 
+        output = self.__forward_from_text_features_list(text_features_list, image_features, label=label, train_separately=train_separately)
+        if not (LOW_MEMORY_MODE and self.prompt_learner_list[0].training): #in this case, just return loss or logits
+            return output
+
+        #ok, so at this point we're ready to do LOW_MEMORY_MODE backprop!
+        assert(LOW_MEMORY_MODE and self.prompt_learner_list[0].training)
+
+        #this backward() call will compute the grads of any parameters that came after the text features (currently none)
+        #it will also compute grad w.r.t. text_features_list
+        output.backward()
+
+        #now we go through each tensor of that grad, use it to create a "fake" loss, and backprop from that loss
+        #each iteration will compute the grads of a different prompt-learner, but it could just as well accumulate if needed
+        for pl, text_features_for_grad in zip(self.prompt_learner_list, text_features_list):
+            text_features_grad = text_features_for_grad.grad
+            text_features = None #this *should* be the point where any memory between image_features and text_features can be garbage-collected
+            text_features = self.__compute_text_features(image_features, pl)
+            fake_loss = torch.sum(text_features * text_features_grad)
+            fake_loss.backward() #this sets/accumulates any necessary gradients
+
+        #make it non-differentiable so caller can't accidentally call backward() again
+        return output.detach()
+
+    #if we're training, this will give back the loss (yes, differentiable)
+    #if we're testing, it'll give back the logits
+    #this method does NOT know or care about LOW_MEMORY_MODE!
+    #it's the caller's job to use the loss to get grad w.r.t. text_features_list and backprop from there in chunks, if that's what they wanna do
+    #text_features_list should be list of tensors, each with shape (N, C, D)
+    def __forward_from_text_features_list(self, text_features_list, image_features, label=None, train_separately=False):
+        logit_scale = self.logit_scale.exp()
         if self.prompt_learner_list[0].training and train_separately:
             #compute losses separately, and average together
             losses = []
@@ -252,10 +289,11 @@ class CoCoOpEnsembling(TrainerX):
         self.model = CustomCLIPEnsembling(cfg, classnames, clip_model) #training-vs-testing-classnames problem has already been taken care of
 
         print("Turning off gradients in both the image and the text encoder")
-        name_to_update = "prompt_learner"
+        name_to_update = "prompt_learner_list"
         
         for name, param in self.model.named_parameters():
             if name_to_update not in name:
+                assert('prompt_learner' not in name)
                 param.requires_grad_(False)
         
         # Double check
@@ -266,13 +304,13 @@ class CoCoOpEnsembling(TrainerX):
         print(f"Parameters to be updated: {enabled}")
 
         if cfg.MODEL.INIT_WEIGHTS:
-            load_pretrained_weights(self.model.prompt_learner, cfg.MODEL.INIT_WEIGHTS)
+            load_pretrained_weights(self.model.prompt_learner_list, cfg.MODEL.INIT_WEIGHTS)
 
         self.model.to(self.device)
         # NOTE: only give prompt_learner to the optimizer
-        self.optim = build_optimizer(self.model.prompt_learner, cfg.OPTIM)
+        self.optim = build_optimizer(self.model.prompt_learner_list, cfg.OPTIM)
         self.sched = build_lr_scheduler(self.optim, cfg.OPTIM)
-        self.register_model("prompt_learner", self.model.prompt_learner, self.optim, self.sched)
+        self.register_model("prompt_learner_list", self.model.prompt_learner_list, self.optim, self.sched)
 
         self.scaler = GradScaler() if cfg.TRAINER.COCOOP_ENSEMBLING.PREC == "amp" else None
 
@@ -293,6 +331,7 @@ class CoCoOpEnsembling(TrainerX):
         
         prec = self.cfg.TRAINER.COCOOP_ENSEMBLING.PREC
         if prec == "amp":
+            assert(not LOW_MEMORY_MODE) #LOW_MEMORY_MODE doesn't support mixed precision (for now)
             with autocast():
                 loss = model(image, label, train_separately=train_separately)
             optim.zero_grad()
@@ -300,9 +339,12 @@ class CoCoOpEnsembling(TrainerX):
             scaler.step(optim)
             scaler.update()
         else:
+            optim.zero_grad() #do this first cuz model.forward() might also call backward()
             loss = model(image, label, train_separately=train_separately)
-            optim.zero_grad()
-            loss.backward()
+#            write_to_log_file(str(time.time()))
+            if not LOW_MEMORY_MODE: #if LOW_MEMORY_MODE then model.forward() already did a backward() call
+                loss.backward()
+
             optim.step()
 
         loss_summary = {"loss": loss.item()}
@@ -348,6 +390,10 @@ class CoCoOpEnsembling(TrainerX):
 
             if "token_suffix" in state_dict:
                 del state_dict["token_suffix"]
+            
+            for k in sorted(state_dict.keys()):
+                if 'DONOTLOAD' in k:
+                    del state_dict[k]
 
             print("Loading weights to {} " 'from "{}" (epoch = {})'.format(name, model_path, epoch))
             # set strict=False

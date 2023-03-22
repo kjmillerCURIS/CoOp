@@ -1,3 +1,9 @@
+# job logs
+job_scripts/*.o*
+job_scripts/*/*.o*
+job_scripts/*.po*
+job_scripts/*/*.po*
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
