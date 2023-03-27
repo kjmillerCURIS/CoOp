@@ -4,5 +4,5 @@ DATASET:
     NAME: "DomainNetCustom"
     SOURCE_DOMAINS_LIST: "0,infograph_painting_quickdraw_real_sketch,1,clipart_painting_quickdraw_real_sketch,2,clipart_infograph_quickdraw_real_sketch,3,clipart_infograph_painting_real_sketch,4,clipart_infograph_painting_quickdraw_sketch,5,clipart_infograph_painting_quickdraw_real"
     TARGET_DOMAINS_LIST: "0,clipart,1,infograph,2,painting,3,quickdraw,4,real,5,sketch"
-    FEWSHOT_FILTER_PATHS: "0,../vislang-domain-exploration-data/DatasetsForCoCoOp/domainnet/fewshot_filter_seed0.pkl"
+    FEWSHOT_FILTER_PATHS: "0,../vislang-domain-exploration-data/DatasetsForCoCoOp/domainnet/fewshot_filter_seed0.pkl,1,../vislang-domain-exploration-data/DatasetsForCoCoOp/domainnet/fewshot_filter_seed1.pkl,2,../vislang-domain-exploration-data/DatasetsForCoCoOp/domainnet/fewshot_filter_seed2.pkl"
     CLASS_SPLIT_PATHS: "random,../vislang-domain-exploration-data/DatasetsForCoCoOp/domainnet/class_split_random.pkl,ordered,../vislang-domain-exploration-data/DatasetsForCoCoOp/domainnet/class_split_ordered.pkl"

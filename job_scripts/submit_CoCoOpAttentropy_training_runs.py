@@ -6,15 +6,17 @@ JOB_NAME_FILTER = None
 
 def submit_CoCoOpAttentropy_training_runs():
     for class_split_type in ['random']:
-        for seed in [0]:
-            fewshot_seed = seed
+#        for fewshot_seed in [0]:
+        for fewshot_seed in [1,2]:
+            seed = 0 #CoCoOp treats "0" as nondeterministic
             for domain_split_index in range(6):
 #                for attentropy_lambda in ['0_1', '0_5', '1_0']:
 #                for attentropy_lambda in ['0_05', '0_2']:
 #                for attentropy_lambda in ['0_0125', '0_025', '0_075']:
-                for attentropy_lambda in ['0_0375']:
+#                for attentropy_lambda in ['0_0375']:
+                for attentropy_lambda in ['0_0125', '0_025', '0_0375', '0_05', '0_075', '0_1', '0_2', '0_5', '1_0']:
                     output_dir = '../vislang-domain-exploration-data/CoCoOpExperiments/baselines/CoCoOpAttentropy_lambda%s/class_split_%s/fewshot_seed%d/seed%d/domain_split%d/train'%(attentropy_lambda, class_split_type, fewshot_seed, seed, domain_split_index)
-                    job_name = 'CoCoOpAttentropy_lambda%s_train_ds%d_cs%s'%(attentropy_lambda, domain_split_index, class_split_type)
+                    job_name = 'CoCoOpAttentropy_lambda%s_train_fs%d_ds%d_cs%s'%(attentropy_lambda, fewshot_seed, domain_split_index, class_split_type)
                     if JOB_NAME_FILTER is not None:
                         if job_name not in JOB_NAME_FILTER:
                             continue

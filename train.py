@@ -168,7 +168,9 @@ def setup_cfg(args):
 
 def main(args):
     cfg = setup_cfg(args)
+    assert(cfg.SEED == -1)
     if cfg.SEED >= 0:
+        assert(False)
         print("Setting fixed seed: {}".format(cfg.SEED))
         set_random_seed(cfg.SEED)
     setup_logger(cfg.OUTPUT_DIR)

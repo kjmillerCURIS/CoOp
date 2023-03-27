@@ -10,11 +10,9 @@ ZEROSHOT_METHODS = ['ZeroshotCLIP', 'ZeroshotCLIP2', 'ZeroshotCLIP2_onetoken']
 #NOTE: you can only do this if you have regular domain-splits!
 def duplicate_for_zeroshot(agg_results):
     for k in sorted(agg_results.keys()):
-        for kk in sorted(agg_results[k].keys()):
-            for kkk in sorted(agg_results[k][kk].keys()):
-                for a in ['seen', 'unseen']:
-                    if 'unseen_domains_%s_classes'%(a) in agg_results[k][kk][kkk]:
-                        agg_results[k][kk][kkk]['seen_domains_%s_classes'%(a)] = agg_results[k][kk][kkk]['unseen_domains_%s_classes'%(a)]
+        for a in ['seen', 'unseen']:
+            if 'unseen_domains_%s_classes'%(a) in agg_results[k]:
+                agg_results[k]['seen_domains_%s_classes'%(a)] = agg_results[k]['unseen_domains_%s_classes'%(a)]
 
     return agg_results
 
@@ -29,15 +27,18 @@ def aggregate_results(experiment_base_dir):
 #    for class_split_type in ['random', 'ordered']:
     for class_split_type in ['random']:
         agg_results[class_split_type] = {}
-        for seed in [0]:
-            fewshot_seed = seed
-            agg_results[class_split_type][fewshot_seed] = {seed : {}}
-            for eval_type in tqdm(['seen_domains_seen_classes', 'seen_domains_unseen_classes', 'unseen_domains_seen_classes', 'unseen_domains_unseen_classes']):
-                if is_zeroshot and ('unseen_domains' not in eval_type):
-                    continue
+        for eval_type in tqdm(['seen_domains_seen_classes', 'seen_domains_unseen_classes', 'unseen_domains_seen_classes', 'unseen_domains_unseen_classes']):
+            if is_zeroshot and ('unseen_domains' not in eval_type):
+                continue
 
-                domain_split_accs = []
-                missing_files = []
+            run_accs = []
+            missing_files = []
+            all_fewshot_seeds = [0,1,2]
+            if is_zeroshot:
+                all_fewshot_seeds = [0]
+
+            for fewshot_seed in all_fewshot_seeds:
+                seed = 0
                 for domain_split_index in range(6):
                     output_dir = os.path.join(experiment_base_dir, 'class_split_%s/fewshot_seed%d/seed%d/domain_split%d/test/%s'%(class_split_type, fewshot_seed, seed, domain_split_index, eval_type))
                     results_filename = os.path.join(output_dir, 'results.pkl')
@@ -45,18 +46,20 @@ def aggregate_results(experiment_base_dir):
                         missing_files.append(results_filename)
                         continue
 
+                    print(results_filename)
                     with open(results_filename, 'rb') as f:
                         results = pickle.load(f)
 
-                    domain_split_accs.append(results['pergroup_accuracy'])
+                    run_accs.append(results['pergroup_accuracy'])
 
-                if len(missing_files) > 0:
-                    print('The following files are missing, therefore we cannot compute aggregate accuracy for this setting: %s'%(str(missing_files)))
-                    continue
+            if len(missing_files) > 0:
+                print('The following files are missing, therefore we cannot compute aggregate accuracy for this setting: %s'%(str(missing_files)))
+                continue
 
-                agg_results[class_split_type][fewshot_seed][seed][eval_type] = np.mean(domain_split_accs)
+            print(run_accs)
+            agg_results[class_split_type][eval_type] = np.mean(run_accs)
 
-    with open(os.path.join(experiment_base_dir, 'agg_results.pkl'), 'wb') as f:
+    with open(os.path.join(experiment_base_dir, 'agg_results_multiseed.pkl'), 'wb') as f:
         pickle.dump(agg_results, f)
     
     if is_zeroshot:

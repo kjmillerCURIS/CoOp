@@ -1,3 +1,7 @@
+NOTE ABOUT SEEDS: If you see "seed0" in an output folder, that means the weights and dataloader and everything random other than the fewshot selection was UNSEEDED. On the other hand, if you see "fewshot_seed0", that means the fewshot selection was seeded with value 0. fewshot is always seeded, and I don't expect to ever seed anything else (besides class split, which I only expect to do once). The CoCoOp codebase treats "0" as a sentinel for "no seed", because it checks "if args.seed", which would treat a zero as False. The "cfg.SEED >= 0" check doesn't matter, because cfg.SEED is default -1 and only gets set if "args.seed" is treated as True. So -1 and 0 are both sentinels for unseeded.
+
+
+
 # Prompt Learning for Vision-Language Models
 
 This repo contains the codebase of a series of research projects focused on adapting vision-language models like [CLIP](https://arxiv.org/abs/2103.00020) to downstream datasets via *prompt learning*:

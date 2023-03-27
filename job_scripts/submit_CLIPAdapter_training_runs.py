@@ -5,12 +5,14 @@ DEBUG=False
 JOB_NAME_FILTER = None
 
 def submit_CLIPAdapter_training_runs():
-    for class_split_type in ['random', 'ordered']:
-        for seed in [0]:
-            fewshot_seed = seed
+#    for class_split_type in ['random', 'ordered']:
+    for class_split_type in ['random']:
+#        for fewshot_seed in [0]:
+        for fewshot_seed in [1,2]:
+            seed = 0 #CoCoOp treats "0" as nondeterministic
             for domain_split_index in range(6):
                 output_dir = '../vislang-domain-exploration-data/CoCoOpExperiments/baselines/CLIPAdapter/class_split_%s/fewshot_seed%d/seed%d/domain_split%d/train'%(class_split_type, fewshot_seed, seed, domain_split_index)
-                job_name = 'CLIPAdapter_train_ds%d_cs%s'%(domain_split_index, class_split_type)
+                job_name = 'CLIPAdapter_train_fs%d_ds%d_cs%s'%(fewshot_seed, domain_split_index, class_split_type)
                 if JOB_NAME_FILTER is not None:
                     if job_name not in JOB_NAME_FILTER:
                         continue
