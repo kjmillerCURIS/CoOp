@@ -118,6 +118,11 @@ def extend_cfg(cfg):
     cfg.TRAINER.COCOOP_ATTENTROPY.CTX_INIT = ""  # initialization words
     cfg.TRAINER.COCOOP_ATTENTROPY.PREC = "fp16"  # fp16, fp32, amp
     cfg.TRAINER.COCOOP_ATTENTROPY.ATTENTROPY_LAMBDA = 1.0
+    
+    cfg.TRAINER.COCOOP_MULTIMODAL = CN()
+    cfg.TRAINER.COCOOP_MULTIMODAL.N_CTX = 16  # number of context vectors
+    cfg.TRAINER.COCOOP_MULTIMODAL.CTX_INIT = ""  # initialization words
+    cfg.TRAINER.COCOOP_MULTIMODAL.PREC = "fp16"  # fp16, fp32, amp
 
     #the CoOp and CoCoOp authors decided to use fp16, while the CLIP-Adapter authors decided to use fp32, so that's what we're doing for now
     cfg.TRAINER.CLIPADAPTER = CN()

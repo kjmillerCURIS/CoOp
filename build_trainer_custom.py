@@ -4,6 +4,7 @@ from trainers.zsclip import ZeroshotCLIP, ZeroshotCLIP2
 from trainers.coop import CoOp
 from trainers.cocoop_ensembling import CoCoOpEnsembling
 from trainers.cocoop_attentropy import CoCoOpAttentropy
+from trainers.cocoop_multimodal import CoCoOpMultimodal
 
 def build_trainer_custom(cfg, train_or_test, fewshot_seed, domain_split_index, class_split_type, eval_type, record_attentropy=False):
     if cfg.TRAINER.NAME == 'CoCoOp':
@@ -20,5 +21,7 @@ def build_trainer_custom(cfg, train_or_test, fewshot_seed, domain_split_index, c
         return CoCoOpEnsembling(cfg, train_or_test, fewshot_seed, domain_split_index, class_split_type, eval_type)
     elif cfg.TRAINER.NAME == 'CoCoOpAttentropy':
         return CoCoOpAttentropy(cfg, train_or_test, fewshot_seed, domain_split_index, class_split_type, eval_type, record_attentropy=record_attentropy)
+    elif cfg.TRAINER.NAME == 'CoCoOpMultimodal':
+        return CoCoOpMultimodal(cfg, train_or_test, fewshot_seed, domain_split_index, class_split_type, eval_type, record_attentropy=record_attentropy)
     else:
         assert(False)
