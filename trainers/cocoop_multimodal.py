@@ -26,6 +26,8 @@ from tqdm import tqdm
 
 from .exposed_text_encoder import ExposedTextEncoder
 
+from .check_learnability import check_learnability
+
 _tokenizer = _Tokenizer()
 
 
@@ -94,9 +96,6 @@ class PromptLearnerMultimodal(nn.Module):
         cfg_imsize = cfg.INPUT.SIZE[0]
         assert cfg_imsize == clip_imsize, f"cfg_imsize ({cfg_imsize}) must equal to clip_imsize ({clip_imsize})"
 
-        #text inputs for multimodal part
-        self.__setup_text_inputs(classnames, clip_model)
-
         #figure out ctx stuff
         assert(random_or_manual in ['random', 'manual'])
         if random_or_manual == 'random':
@@ -161,7 +160,7 @@ class PromptLearnerMultimodal(nn.Module):
             ("relu", nn.ReLU(inplace=True)),
             ("linear2", nn.Linear(vis_dim // 16, ctx_dim))
         ]))
-        
+
         if prec == "fp16":
             self.meta_net.half()
 
@@ -194,6 +193,9 @@ class PromptLearnerMultimodal(nn.Module):
         self.tokenized_prompts = tokenized_prompts  # torch.Tensor
         self.name_lens = name_lens
 
+        #text inputs for multimodal part
+        self.__setup_text_inputs(classnames, clip_model)
+
     def __setup_text_inputs(self, classnames, clip_model):
         my_clip_model = clip_model.to('cuda')
         prompts = [TEXT_INPUT_TEMPLATE.format(name.replace('_', ' ')) for name in classnames]
@@ -201,7 +203,6 @@ class PromptLearnerMultimodal(nn.Module):
         with torch.no_grad():
             text_inputs = my_clip_model.encode_text(prompts)
             text_inputs = text_inputs / text_inputs.norm(dim=-1, keepdim=True)
-            text_inputs = text_inputs.to(self.device)
 
         self.register_buffer('text_inputs', text_inputs)
 
@@ -232,27 +233,34 @@ class PromptLearnerMultimodal(nn.Module):
 
         return torch.stack(prompts)
 
-    def forward(self, im_features):
+    #if custom_text_inputs is not None, then it should have shape (batch, n_cls, vis_dim)
+    def forward(self, im_features, custom_text_inputs=None):
         assert(len(im_features.shape) == 2)
-        meta_inputs = torch.cat([im_features.repeat_interleave(self.n_cls,dim=0), self.text_inputs.repeat(im_features.shape[0],1)], dim=1)
+        if custom_text_inputs is None:
+            my_text_inputs = self.text_inputs.repeat(im_features.shape[0],1)
+        else:
+            my_text_inputs = torch.flatten(custom_text_inputs, start_dim=0, end_dim=1)
+
+        meta_inputs = torch.cat([im_features.repeat_interleave(self.n_cls,dim=0), my_text_inputs], dim=1)
         biases = self.meta_net(meta_inputs) #(batch * n_cls, ctx_dim)
+        biases = biases.unsqueeze(1) #(batch * n_cls, 1, ctx_dim)
 
         prompts = []
         for i in range(im_features.shape[0]): #for each image in batch
             ctx_beforename_i = None
             if self.ctx_beforename is not None:
-                ctx_beforename_i = self.ctx_beforename.unsqueeze(0) + biases[i*self.n_cls:(i+1)*self.n_cls,:]
-            
+                ctx_beforename_i = self.ctx_beforename.unsqueeze(0) + biases[i*self.n_cls:(i+1)*self.n_cls,:,:]
+
             ctx_aftername_i = None
             if self.ctx_aftername is not None:
-                ctx_aftername_i = self.ctx_aftername.unsqueeze(0) + biases[i*self.n_cls:(i+1)*self.n_cls,:]
+                ctx_aftername_i = self.ctx_aftername.unsqueeze(0) + biases[i*self.n_cls:(i+1)*self.n_cls,:,:]
 
             pts_i = self.construct_prompts(ctx_beforename_i, ctx_aftername_i)
             assert(pts_i.shape[0] == self.n_cls)
             prompts.append(pts_i)
 
         prompts = torch.stack(prompts)
-        
+
         return prompts
 
 
@@ -280,6 +288,35 @@ class CustomCLIPMultimodal(nn.Module):
         self.logit_scale = clip_model.logit_scale
         self.dtype = clip_model.dtype
 
+        self.num_metanet_passes = algo_cfg.NUM_METANET_PASSES
+        assert(self.num_metanet_passes >= 1)
+
+    #if custom_text_inputs is not None, then it should have shape (batch, n_cls, vis_dim)
+    #will return text_features tensor of shape (batch, n_cls, vis_dim)
+    #yes, text_features is normalized, and yes, we expect custom_text_inputs to be normalized
+    def __compute_text_features(self, image_features, custom_text_inputs=None):
+        prompts = self.prompt_learner(image_features, custom_text_inputs=custom_text_inputs)
+        if self.return_attn_probs:
+            attn_probs = []
+
+        text_features = []
+        for pts_i in prompts: #this is a loop across the batch
+            if self.return_attn_probs:
+                text_features_i, attn_probs_i = self.text_encoder(pts_i, self.tokenized_prompts)
+                attn_probs.append(attn_probs_i)
+            else:
+                text_features_i = self.text_encoder(pts_i, self.tokenized_prompts)
+
+            text_features_i = text_features_i / text_features_i.norm(dim=-1, keepdim=True)
+            text_features.append(text_features_i)
+
+        text_features = torch.stack(text_features)
+        if self.return_attn_probs:
+            return text_features, attn_probs
+        else:
+            return text_features
+
+    #if self.return_attn_probs, then we'll just club them all together, from all the loops
     def forward(self, image, label=None):
         tokenized_prompts = self.tokenized_prompts
         logit_scale = self.logit_scale.exp()
@@ -287,35 +324,43 @@ class CustomCLIPMultimodal(nn.Module):
         image_features = self.image_encoder(image.type(self.dtype))
         image_features = image_features / image_features.norm(dim=-1, keepdim=True)
 
-        prompts = self.prompt_learner(image_features)
-        
-        logits = []
+        #self.num_metanet_passes is the number of times we call the MetaNet
+        #so it has to be at least 1
+        #if self.num_metanet_passes is 1, then we just call __compute_text_features without custom_text_inputs, and call it a day
+        #else, we call it a bunch more times
+
+        #here's the first pass
+        attn_probs = []
         if self.return_attn_probs:
-            attn_probs = []
+            text_features, attn_probs_j = self.__compute_text_features(image_features)
+            attn_probs.extend(attn_probs_j)
+        else:
+            text_features = self.__compute_text_features(image_features)
 
-        for pts_i, imf_i in zip(prompts, image_features): #this is a loop across the batch
+        #and now we do more (if needed)!
+        for t in range(self.num_metanet_passes - 1):
             if self.return_attn_probs:
-                text_features, attn_probs_i = self.text_encoder(pts_i, tokenized_prompts)
-                assert(attn_probs_i.shape == tokenized_prompts.shape) #should be (num_classes, seq_len)
+                text_features, attn_probs_j = self.__compute_text_features(image_features, custom_text_inputs=text_features)
+                attn_probs.extend(attn_probs_j)
             else:
-                text_features = self.text_encoder(pts_i, tokenized_prompts)
+                text_features = self.__compute_text_features(image_features, custom_text_inputs=text_features)
 
-            text_features = text_features / text_features.norm(dim=-1, keepdim=True)
-            l_i = logit_scale * imf_i @ text_features.t()
+        #ok, so now we're ready to do cossims!
+        logits = []
+        for text_features_i, imf_i in zip(text_features, image_features): #this is a loop across the batch
+            l_i = logit_scale * imf_i @ text_features_i.t()
             logits.append(l_i)
-            if self.return_attn_probs:
-                attn_probs.append(attn_probs_i)
 
         logits = torch.stack(logits)
         if self.return_attn_probs:
-            attn_probs = torch.stack(attn_probs) #should be (batch_size, num_classes, seq_len)
+            attn_probs = torch.stack(attn_probs) #should be (num_metanet_passes * batch_size, num_classes, seq_len), where batch is inner
 
         if self.prompt_learner.training:
             if self.return_attn_probs:
                 return F.cross_entropy(logits, label), attn_probs
             else:
                 return F.cross_entropy(logits, label)
-        
+
         if self.return_attn_probs:
             return logits, attn_probs
         else:
@@ -406,6 +451,7 @@ class CoCoOpMultimodal(TrainerX):
             if param.requires_grad:
                 enabled.add(name)
         print(f"Parameters to be updated: {enabled}")
+        check_learnability(enabled, ['meta_net', 'ctx_beforename', 'ctx_aftername'])
 
         if cfg.MODEL.INIT_WEIGHTS:
             load_pretrained_weights(self.model.prompt_learner, cfg.MODEL.INIT_WEIGHTS)
@@ -493,6 +539,11 @@ class CoCoOpMultimodal(TrainerX):
             for k in sorted(state_dict.keys()):
                 if 'DONOTLOAD' in k:
                     del state_dict[k]
+
+            if 'text_inputs' in state_dict:
+                del state_dict['text_inputs']
+            else:
+                assert(False) #pretty dang sure it's there!
 
             print("Loading weights to {} " 'from "{}" (epoch = {})'.format(name, model_path, epoch))
             # set strict=False

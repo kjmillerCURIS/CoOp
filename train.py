@@ -105,7 +105,7 @@ def extend_cfg(cfg):
     cfg.TRAINER.COCOOP.N_CTX = 16  # number of context vectors
     cfg.TRAINER.COCOOP.CTX_INIT = ""  # initialization words
     cfg.TRAINER.COCOOP.PREC = "fp16"  # fp16, fp32, amp
-    
+
     cfg.TRAINER.COCOOP_ENSEMBLING = CN()
     cfg.TRAINER.COCOOP_ENSEMBLING.PREC = "fp16"  # fp16, fp32, amp
     cfg.TRAINER.COCOOP_ENSEMBLING.RANDOM_CTX_INIT = False
@@ -118,11 +118,29 @@ def extend_cfg(cfg):
     cfg.TRAINER.COCOOP_ATTENTROPY.CTX_INIT = ""  # initialization words
     cfg.TRAINER.COCOOP_ATTENTROPY.PREC = "fp16"  # fp16, fp32, amp
     cfg.TRAINER.COCOOP_ATTENTROPY.ATTENTROPY_LAMBDA = 1.0
-    
+
     cfg.TRAINER.COCOOP_MULTIMODAL = CN()
     cfg.TRAINER.COCOOP_MULTIMODAL.N_CTX = 16  # number of context vectors
     cfg.TRAINER.COCOOP_MULTIMODAL.CTX_INIT = ""  # initialization words
     cfg.TRAINER.COCOOP_MULTIMODAL.PREC = "fp16"  # fp16, fp32, amp
+    cfg.TRAINER.COCOOP_MULTIMODAL.NUM_METANET_PASSES = 1
+
+    cfg.TRAINER.COCOOP_EFFICIENT_ONETOKEN_ENSEMBLING = CN()
+    cfg.TRAINER.COCOOP_EFFICIENT_ONETOKEN_ENSEMBLING.PREC = "fp16"  # fp16, fp32, amp
+    cfg.TRAINER.COCOOP_EFFICIENT_ONETOKEN_ENSEMBLING.RANDOM_CTX_INIT = False
+    cfg.TRAINER.COCOOP_EFFICIENT_ONETOKEN_ENSEMBLING.TRAIN_SEPARATELY = False
+    cfg.TRAINER.COCOOP_EFFICIENT_ONETOKEN_ENSEMBLING.ONETOKEN = False
+    cfg.TRAINER.COCOOP_EFFICIENT_ONETOKEN_ENSEMBLING.NOPERIOD = False
+
+    cfg.TRAINER.COCOOP_ENSEMBLING_LAIONIZED = CN()
+    cfg.TRAINER.COCOOP_ENSEMBLING_LAIONIZED.PREC = "fp16"  # fp16, fp32, amp
+    cfg.TRAINER.COCOOP_ENSEMBLING_LAIONIZED.RANDOM_CTX_INIT = False
+    cfg.TRAINER.COCOOP_ENSEMBLING_LAIONIZED.TRAIN_SEPARATELY = False
+    cfg.TRAINER.COCOOP_ENSEMBLING_LAIONIZED.ONETOKEN = False
+    cfg.TRAINER.COCOOP_ENSEMBLING_LAIONIZED.NOPERIOD = False
+    cfg.TRAINER.COCOOP_ENSEMBLING_LAIONIZED.LAION_NUM_POSITIVES = 1
+    cfg.TRAINER.COCOOP_ENSEMBLING_LAIONIZED.LAION_LAMBDA = 1.0
+    cfg.TRAINER.COCOOP_ENSEMBLING_LAIONIZED.GRAMLEN = 1
 
     #the CoOp and CoCoOp authors decided to use fp16, while the CLIP-Adapter authors decided to use fp32, so that's what we're doing for now
     cfg.TRAINER.CLIPADAPTER = CN()
@@ -193,7 +211,8 @@ def main(args):
         assert(not args.no_train)
         train_or_test = 'train'
 
-    trainer = build_trainer_custom(cfg, train_or_test, args.fewshot_seed, args.domain_split_index, args.class_split_type, args.eval_type, record_attentropy=args.record_attentropy)
+    laion_data_dir = (args.laion_data_dir if args.laion_data_dir != '' else None)
+    trainer = build_trainer_custom(cfg, train_or_test, args.fewshot_seed, args.domain_split_index, args.class_split_type, args.eval_type, record_attentropy=args.record_attentropy, record_examples=args.record_examples, laion_data_dir=laion_data_dir)
 
     if args.eval_only:
         results_filename = os.path.join(cfg.OUTPUT_DIR, 'results.pkl')
@@ -289,11 +308,15 @@ if __name__ == "__main__":
         "--eval-type", type=str, default="seen_domains_seen_classes", help="which domains and classes we evaluate on (only relevant for eval mode, i.e. if you pass in eval-only flag)"
     )
     parser.add_argument(
+        "--laion-data-dir", type=str, default='', help='dir with LAION data for LAIONized training'
+    )
+    parser.add_argument(
         "opts",
         default=None,
         nargs=argparse.REMAINDER,
         help="modify config options using the command-line",
     )
     parser.add_argument("--record-attentropy", action="store_true", help="record text attention map entropies (only happens during test, and only for CoCoOp and ZeroshotCLIP)")
+    parser.add_argument("--record-examples", action="store_true", help="record a few examples (only happens during test, and only for CoCoOp)")
     args = parser.parse_args()
     main(args)

@@ -25,6 +25,8 @@ from tqdm import tqdm
 
 from .cocoop import CustomCLIP, load_clip_to_cpu
 
+from .check_learnability import check_learnability
+
 
 #@TRAINER_REGISTRY.register()
 class CoCoOpAttentropy(TrainerX):
@@ -109,7 +111,9 @@ class CoCoOpAttentropy(TrainerX):
         for name, param in self.model.named_parameters():
             if param.requires_grad:
                 enabled.add(name)
+         
         print(f"Parameters to be updated: {enabled}")
+        check_learnability(enabled, ['meta_net', 'ctx_beforename', 'ctx_aftername'])
 
         if cfg.MODEL.INIT_WEIGHTS:
             load_pretrained_weights(self.model.prompt_learner, cfg.MODEL.INIT_WEIGHTS)

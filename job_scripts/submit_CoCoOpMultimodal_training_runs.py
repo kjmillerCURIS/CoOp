@@ -2,10 +2,10 @@ import os
 import sys
 from friendly_submitter import FriendlySubmitter
 
-DEBUG=True
+DEBUG=False
 JOB_NAME_FILTER = None
 INTERVAL = 0.75
-BATCH_SIZE = 12
+BATCH_SIZE = 9
 
 def submit_CoCoOpMultimodal_training_runs():
     my_friend = FriendlySubmitter(INTERVAL, batch_size=BATCH_SIZE)

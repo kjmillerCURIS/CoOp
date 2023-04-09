@@ -20,17 +20,38 @@ from clip.simple_tokenizer import SimpleTokenizer as _Tokenizer
 from data_manager_custom import DataManagerCustom
 from custom_classification_evaluator import CustomClassificationEvaluator
 
-import time
 import datetime
+import time
+import random
 from tqdm import tqdm
 
 from .exposed_text_encoder import ExposedTextEncoder
 
+from .check_learnability import check_learnability
+
 _tokenizer = _Tokenizer()
 
+#from write_to_log_file import write_to_log_file
 
+NUM_EXAMPLES_TO_RECORD = 7
 PRINT_INIT = True
 
+def easy_load_ViTB16_whole(device='cuda'):
+    from yacs.config import CfgNode as CN
+    cfg = CN()
+    cfg.MODEL = CN()
+    cfg.MODEL.BACKBONE = CN()
+    cfg.MODEL.BACKBONE.NAME = 'ViT-B/16'
+    clip_model = load_clip_to_cpu(cfg)
+    assert(clip_model.dtype == torch.float16)
+    clip_model = clip_model.to(device=device) #gotta do it this way so it'll know to put it to torch.float16 I guess...
+    return clip_model
+
+#load the CLIP ViT-B/16 to whatever device (default GPU). Will naturally come out as torch.float16
+def easy_load_ViTB16(device='cuda'):
+    clip_model = easy_load_ViTB16_whole(device=device)
+    image_encoder = clip_model.visual
+    return image_encoder
 
 def load_clip_to_cpu(cfg):
     backbone_name = cfg.MODEL.BACKBONE.NAME
@@ -59,6 +80,9 @@ class TextEncoder(nn.Module):
         self.text_projection = clip_model.text_projection
         self.dtype = clip_model.dtype
 
+        #in case someone needs it
+        self.token_embedding = clip_model.token_embedding
+
     def forward(self, prompts, tokenized_prompts):
         x = prompts + self.positional_embedding.type(self.dtype)
         x = x.permute(1, 0, 2)  # NLD -> LND
@@ -80,14 +104,17 @@ class PromptLearner(nn.Module):
     #random_or_manual should be 'random' if we initialize our prompts randomly, 'manual' if we use manual intiialization
     #if 'random' then n_ctx_or_ctx_init should be a pair of numbers
     #if 'manual' then n_ctx_or_ctx_init should be a pair of strings
-    def __init__(self, cfg, classnames, clip_model, random_or_manual, n_ctx_or_ctx_init, prec='fp16', noperiod=False):
+    def __init__(self, cfg, classnames, clip_model, random_or_manual, n_ctx_or_ctx_init, prec='fp16', noperiod=False, num_meta_out=1):
         super().__init__()
-        
+
+        self.num_meta_out = num_meta_out
+
         #standard setup stuff
         n_cls = len(classnames)
         dtype = clip_model.dtype
         ctx_dim = clip_model.ln_final.weight.shape[0]
         vis_dim = clip_model.visual.output_dim
+        self.vis_dim = vis_dim
         clip_imsize = clip_model.visual.input_resolution
         cfg_imsize = cfg.INPUT.SIZE[0]
         assert cfg_imsize == clip_imsize, f"cfg_imsize ({cfg_imsize}) must equal to clip_imsize ({clip_imsize})"
@@ -150,13 +177,9 @@ class PromptLearner(nn.Module):
 
         print(f'Initial contexts: "{prompt_filler_beforename}", "{prompt_filler_aftername}"')
         print(f"Number of context words (tokens): {n_ctx_beforename}, {n_ctx_aftername}")
+ 
+        self.build_meta_net(vis_dim, ctx_dim)
 
-        self.meta_net = nn.Sequential(OrderedDict([
-            ("linear1", nn.Linear(vis_dim, vis_dim // 16)),
-            ("relu", nn.ReLU(inplace=True)),
-            ("linear2", nn.Linear(vis_dim // 16, ctx_dim))
-        ]))
-        
         if prec == "fp16":
             self.meta_net.half()
 
@@ -172,7 +195,7 @@ class PromptLearner(nn.Module):
 
         prompts = [prompt_filler_beforename + name + prompt_filler_aftername + period for name in classnames]
         tokenized_prompts = torch.cat([clip.tokenize(p) for p in prompts])  # (n_cls, n_tkn)
-        with torch.no_grad():
+        with torch.no_grad(): #CAUTION: this part might be *damn* important in keeping the token_embedding from becoming learnable!
             embedding = clip_model.token_embedding(tokenized_prompts).type(dtype)
 
         #have to store things separately because some class names might have different numbers of tokens, so parts might have different lengths
@@ -189,7 +212,14 @@ class PromptLearner(nn.Module):
         self.tokenized_prompts = tokenized_prompts  # torch.Tensor
         self.name_lens = name_lens
 
-    def construct_prompts(self, ctx_beforename, ctx_aftername):
+    def build_meta_net(self, vis_dim, ctx_dim):
+        self.meta_net = nn.Sequential(OrderedDict([
+            ("linear1", nn.Linear(vis_dim, vis_dim // 16)),
+            ("relu", nn.ReLU(inplace=True)),
+            ("linear2", nn.Linear(vis_dim // 16, self.num_meta_out * ctx_dim))
+        ]))
+
+    def construct_prompts_helper(self, start_parts, ctx_beforename, name_parts, ctx_aftername, end_parts):
         #this assumes that we're constructing one prompt for each class
         #ctx_beforename should have shape (n_ctx_beforename, ctx_dim)
         #ctx_aftername should have shape (n_ctx_aftername, ctx_dim)
@@ -197,11 +227,7 @@ class PromptLearner(nn.Module):
         #self.end_parts would have the period (if used) and the EOS token, and a bunch of padding (which the transformer will ignore cuz it's causal)
 
         prompts = []
-        for i in range(self.n_cls):
-            start_part = self._buffers['DONOTLOAD_start_part_%d'%(i)]
-            name_part = self._buffers['DONOTLOAD_name_part_%d'%(i)]
-            end_part = self._buffers['DONOTLOAD_end_part_%d'%(i)]
-            
+        for start_part, name_part, end_part in zip(start_parts, name_parts, end_parts):
             items = [start_part]
             if ctx_beforename is not None:
                 items.append(ctx_beforename)
@@ -215,9 +241,19 @@ class PromptLearner(nn.Module):
             prompts.append(prompt)
 
         return torch.stack(prompts)
+    
+    def construct_prompts(self, ctx_beforename, ctx_aftername):
+        start_parts = [self._buffers['DONOTLOAD_start_part_%d'%(i)] for i in range(self.n_cls)]
+        name_parts = [self._buffers['DONOTLOAD_name_part_%d'%(i)] for i in range(self.n_cls)]
+        end_parts = [self._buffers['DONOTLOAD_end_part_%d'%(i)] for i in range(self.n_cls)]
+        return self.construct_prompts_helper(start_parts, ctx_beforename, name_parts, ctx_aftername, end_parts)
+
+    def compute_meta_token(self, im_features):
+        meta_out = self.meta_net(im_features)
+        return meta_out[:,:self.vis_dim]
 
     def forward(self, im_features):
-        bias = self.meta_net(im_features) #(batch, ctx_dim)
+        bias = self.compute_meta_token(im_features) #(batch, ctx_dim)
         bias = bias.unsqueeze(1) #(batch, 1, ctx_dim)
         if self.ctx_beforename is not None:
             ctx_beforename_shifted = self.ctx_beforename.unsqueeze(0) + bias
@@ -241,6 +277,7 @@ class PromptLearner(nn.Module):
 
         prompts = torch.stack(prompts)
         
+#        print('MEOW: prompts.dtype=%s'%(str(prompts.dtype)))
         return prompts
 
 
@@ -261,14 +298,15 @@ class CustomCLIP(nn.Module):
         self.image_encoder = clip_model.visual
         self.return_attn_probs = return_attn_probs
         if self.return_attn_probs:
-            self.text_encoder = ExposedTextEncoder(clip_model)
+            self.text_encoder = ExposedTextEncoder(clip_model) #this is on the CustomCLIP, NOT the PromptLearner, therefore it does NOT become learnable!
         else:
-            self.text_encoder = TextEncoder(clip_model)
+            self.text_encoder = TextEncoder(clip_model) #ditto
 
         self.logit_scale = clip_model.logit_scale
         self.dtype = clip_model.dtype
 
-    def forward(self, image, label=None):
+    #if example_mode then return (text_embs, cossims, probs, prompt_strs) instead of what you would've returned
+    def forward(self, image, label=None, example_mode=False):
         tokenized_prompts = self.tokenized_prompts
         logit_scale = self.logit_scale.exp()
 
@@ -276,12 +314,26 @@ class CustomCLIP(nn.Module):
         image_features = image_features / image_features.norm(dim=-1, keepdim=True)
 
         prompts = self.prompt_learner(image_features)
-        
+
         logits = []
         if self.return_attn_probs:
             attn_probs = []
 
+        if example_mode:
+            text_embs, cossims, probs, prompt_strs = [], [], [], []
+
         for pts_i, imf_i in zip(prompts, image_features): #this is a loop across the batch
+            if example_mode:
+                ends = tokenized_prompts.argmax(dim=-1)
+                prompt_strs_one_example = []
+                for pts_ij, ends_j in zip(pts_i, ends):
+                    stuff = pts_ij[1:ends_j.item()]
+                    nearest_tokens = torch.cdist(stuff, self.text_encoder.token_embedding.weight.type(self.dtype)).argmin(dim=1)
+                    prompt_str = ''.join([_tokenizer.decoder[tok.item()].replace('</w>', ' ') for tok in nearest_tokens])
+                    prompt_strs_one_example.append(prompt_str)
+
+                prompt_strs.append(prompt_strs_one_example)
+
             if self.return_attn_probs:
                 text_features, attn_probs_i = self.text_encoder(pts_i, tokenized_prompts)
                 assert(attn_probs_i.shape == tokenized_prompts.shape) #should be (num_classes, seq_len)
@@ -289,14 +341,29 @@ class CustomCLIP(nn.Module):
                 text_features = self.text_encoder(pts_i, tokenized_prompts)
 
             text_features = text_features / text_features.norm(dim=-1, keepdim=True)
-            l_i = logit_scale * imf_i @ text_features.t()
+            if example_mode:
+                assert(text_features.shape == (self.prompt_learner.n_cls, self.prompt_learner.vis_dim))
+                text_embs.append(text_features)
+
+            cossims_i = imf_i @ text_features.t()
+            if example_mode:
+                assert(cossims_i.shape == (self.prompt_learner.n_cls,))
+                cossims.append(cossims_i)
+
+            l_i = logit_scale * cossims_i
             logits.append(l_i)
+            if example_mode:
+                probs.append(F.softmax(l_i, dim=0))
+
             if self.return_attn_probs:
                 attn_probs.append(attn_probs_i)
 
         logits = torch.stack(logits)
         if self.return_attn_probs:
             attn_probs = torch.stack(attn_probs) #should be (batch_size, num_classes, seq_len)
+
+        if example_mode:
+            return torch.stack(text_embs), torch.stack(cossims), torch.stack(probs), prompt_strs
 
         if self.prompt_learner.training:
             if self.return_attn_probs:
@@ -313,9 +380,10 @@ class CustomCLIP(nn.Module):
 #@TRAINER_REGISTRY.register()
 class CoCoOp(TrainerX):
     
-    def __init__(self, cfg, train_or_test, fewshot_seed, domain_split_index, class_split_type, eval_type, record_attentropy=False):
+    def __init__(self,cfg,train_or_test,fewshot_seed,domain_split_index,class_split_type,eval_type,record_attentropy=False,record_examples=False):
         assert(train_or_test in ['train', 'test'])
         self.record_attentropy = record_attentropy
+        self.record_examples = record_examples
         
         #stuff from TrainerBase.__init__()
         self._models = OrderedDict()
@@ -373,6 +441,7 @@ class CoCoOp(TrainerX):
 
         print(f"Loading CLIP (backbone: {cfg.MODEL.BACKBONE.NAME})")
         clip_model = load_clip_to_cpu(cfg)
+#        write_to_log_file('MEOWMEOWMEOWMEOWMEOWMEOW: right after load_clip_to_cpu clip_model.dtype %s'%(str(clip_model.dtype)))
         
         if cfg.TRAINER.COCOOP.PREC == "fp32" or cfg.TRAINER.COCOOP.PREC == "amp":
             # CLIP's default precision is fp16
@@ -394,6 +463,8 @@ class CoCoOp(TrainerX):
             if param.requires_grad:
                 enabled.add(name)
         print(f"Parameters to be updated: {enabled}")
+
+        check_learnability(enabled, ['meta_net', 'ctx_beforename', 'ctx_aftername'])
 
         if cfg.MODEL.INIT_WEIGHTS:
             load_pretrained_weights(self.model.prompt_learner, cfg.MODEL.INIT_WEIGHTS)
@@ -488,6 +559,12 @@ class CoCoOp(TrainerX):
     
     @torch.no_grad()
     def test(self, split=None):
+
+        if self.record_examples:
+            examples = {}
+            example_indices = random.sample(range(len(self.dm.dataset.test)), NUM_EXAMPLES_TO_RECORD)
+            print('EXAMPLE INDICES: ' + str(example_indices))
+
         """A generic testing pipeline."""
         details = {}
         
@@ -505,6 +582,9 @@ class CoCoOp(TrainerX):
 
         print(f"Evaluate on the *{split}* set")
 
+        if self.record_examples:
+            cur_t = 0
+
         for batch_idx, batch in enumerate(tqdm(data_loader)):
             input, label, domain = self.parse_batch_test(batch)
             if self.record_attentropy:
@@ -520,6 +600,32 @@ class CoCoOp(TrainerX):
                 attentropies = attentropies.cpu().numpy()
             else:
                 output = self.model(input)
+
+            if self.record_examples:
+                for tt in range(input.shape[0]):
+                    if cur_t + tt not in example_indices:
+                        continue
+
+                    #make an example
+                    example = {'gt' : {}, 'argmax' : {}, 'argmed' : {}}
+                    text_embs, cossims, probs, prompt_strs = self.model(input[tt,:,:,:].unsqueeze(0), example_mode=True)
+                    print('MEOWWWWWWWWW!!!!!!')
+                    gt_cls = label[tt].item()
+                    argmax_cls = np.argmax(cossims[0,:].cpu().numpy())
+                    argmed_cls = np.argsort(cossims[0,:].cpu().numpy())[cossims.shape[1] // 2]
+                    for stat_type, stat_cls in zip(['gt', 'argmax', 'argmed'], [gt_cls, argmax_cls, argmed_cls]):
+                        stat = {}
+                        stat['name'] = self.dm.dataset.classnames_test[stat_cls]
+                        stat['cossim'] = cossims[0, stat_cls].item()
+                        stat['prob'] = probs[0, stat_cls].item()
+                        stat['text_emb'] = text_embs[0, stat_cls].cpu().numpy()
+                        stat['prompt_str'] = prompt_strs[0][stat_cls]
+                        example[stat_type] = stat
+
+                    impath = batch['impath'][tt]
+                    examples[impath] = example
+
+                cur_t += input.shape[0]
 
             self.evaluator.process(output, label, domain)
             test_loss = F.cross_entropy(output, label, reduce=False, reduction='none')
@@ -540,6 +646,8 @@ class CoCoOp(TrainerX):
             self.write_scalar(tag, v, self.epoch)
 
         results['details'] = details
+        if self.record_examples:
+            results['examples'] = examples
 
         return list(results.values())[0], results
     

@@ -3,6 +3,7 @@ import sys
 import numpy as np
 import pickle
 import pprint
+from scipy.stats import hmean
 from tqdm import tqdm
 
 ZEROSHOT_METHODS = ['ZeroshotCLIP', 'ZeroshotCLIP2', 'ZeroshotCLIP2_onetoken']
@@ -58,6 +59,12 @@ def aggregate_results(experiment_base_dir):
 
             print(run_accs)
             agg_results[class_split_type][eval_type] = np.mean(run_accs)
+
+        if len(agg_results[class_split_type].keys()) == (2 if is_zeroshot else 4):
+            nums = [agg_results[class_split_type][k] for k in sorted(agg_results[class_split_type].keys())]
+            assert(len(nums) == (2 if is_zeroshot else 4))
+            assert('H' not in agg_results[class_split_type])
+            agg_results[class_split_type]['H'] = hmean(nums)
 
     with open(os.path.join(experiment_base_dir, 'agg_results_multiseed.pkl'), 'wb') as f:
         pickle.dump(agg_results, f)

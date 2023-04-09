@@ -9,7 +9,7 @@ import random
 from tqdm import tqdm
 
 #image stuff
-NUM_ROWS = 10000000
+NUM_ROWS = 10000000000
 COLLAGE_WIDTH = 3200
 IMAGE_HEIGHT = 224
 BUFFER_THICKNESS = 20
@@ -26,6 +26,7 @@ TEXT_RESIZE_FACTOR = 5
 
 def make_collage_one_image_dir(image_dir):
     images = sorted(glob.glob(os.path.join(image_dir, '*', '*.jpg')))
+    print(len(images))
     rows = [[]]
     cur_x = 0
     for image in images:
@@ -42,6 +43,7 @@ def make_collage_one_image_dir(image_dir):
             rows[-1].append(255 * np.ones((IMAGE_HEIGHT, COLLAGE_WIDTH - cur_x, 3), dtype='uint8'))
             cur_x = 0
             if len(rows) >= NUM_ROWS:
+                assert(False)
                 break
             else:
                 rows.append([])
@@ -52,6 +54,7 @@ def make_collage_one_image_dir(image_dir):
             rows[-1].append(255 * np.ones((IMAGE_HEIGHT, COLLAGE_WIDTH - cur_x, 3), dtype='uint8'))
             cur_x = 0
             if len(rows) >= NUM_ROWS:
+                assert(False)
                 break
             else:
                 rows.append([])

@@ -1,8 +1,8 @@
 import os
 import sys
 
-SKIP_IF_ALREADY_RESULTS = True
-DEBUG=False
+SKIP_IF_ALREADY_RESULTS = False
+DEBUG=True
 JOB_NAME_FILTER = None
 RECORD_ATTENTROPY = False
 
