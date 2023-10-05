@@ -7,7 +7,7 @@ from PIL import Image, ImageDraw, ImageFont
 import textwrap
 
 #chatGPT wrote most of this function
-def caption_image(numI, caption_lines, font_size=16, width_ratio=0.9, height_buffer=0.1):
+def caption_image(numI, caption_lines, font_size=16, width_ratio=0.9, height_buffer=0.25):
 
     image = Image.fromarray(numI)
 

@@ -7,6 +7,7 @@ from trainers.cocoop_attentropy import CoCoOpAttentropy
 from trainers.cocoop_multimodal import CoCoOpMultimodal
 from trainers.cocoop_efficient_onetoken_ensembling import CoCoOpEfficientOnetokenEnsembling
 from trainers.cocoop_ensembling_laionized import CoCoOpEnsemblingLAIONized
+from trainers.cocoop_ensembling_laionized_fixed_classname import CoCoOpEnsemblingLAIONizedFixedClassname
 
 def build_trainer_custom(cfg, train_or_test, fewshot_seed, domain_split_index, class_split_type, eval_type, record_attentropy=False, record_examples=False, laion_data_dir=None):
     if cfg.TRAINER.NAME == 'CoCoOp':
@@ -29,5 +30,7 @@ def build_trainer_custom(cfg, train_or_test, fewshot_seed, domain_split_index, c
         return CoCoOpEfficientOnetokenEnsembling(cfg, train_or_test, fewshot_seed, domain_split_index, class_split_type, eval_type)
     elif cfg.TRAINER.NAME == 'CoCoOpEnsemblingLAIONized':
         return CoCoOpEnsemblingLAIONized(cfg, train_or_test, fewshot_seed, domain_split_index, class_split_type, eval_type, laion_data_dir)
+    elif cfg.TRAINER.NAME == 'CoCoOpEnsemblingLAIONizedFixedClassname':
+        return CoCoOpEnsemblingLAIONizedFixedClassname(cfg, train_or_test, fewshot_seed, domain_split_index, class_split_type, eval_type, laion_data_dir)
     else:
         assert(False)

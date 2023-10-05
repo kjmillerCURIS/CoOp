@@ -3,7 +3,7 @@ import sys
 from crontab import CronTab
 from datetime import datetime, timedelta
 
-DEFAULT_WAITING_PERIOD = 2 / 60
+DEFAULT_WAITING_PERIOD = 1 / 60
 DEFAULT_WORKING_DIR = '/usr3/graduate/nivek/data/CoOp/job_scripts'
 DEFAULT_BATCH_SIZE = 10
 
